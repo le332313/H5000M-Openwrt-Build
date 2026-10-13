@@ -1,0 +1,22 @@
+{
+	"luci-app-h5000m-upgrade": {
+		"description": "Grant access to the H5000M firmware upgrade page",
+		"read": {
+			"ubus": {
+				"luci.h5000m_upgrade": [ "status", "check", "progress" ]
+			},
+			"file": {
+				"/etc/h5000m-upgrade.url": [ "read" ],
+				"/etc/h5000m-build-id": [ "read" ],
+				"/etc/openwrt_release": [ "read" ]
+			},
+			"uci": [ "h5000m_upgrade" ]
+		},
+		"write": {
+			"ubus": {
+				"luci.h5000m_upgrade": [ "start", "flash", "cancel" ]
+			},
+			"uci": [ "h5000m_upgrade" ]
+		}
+	}
+}

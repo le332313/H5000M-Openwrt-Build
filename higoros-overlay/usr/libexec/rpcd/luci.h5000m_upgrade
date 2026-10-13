@@ -1,0 +1,394 @@
+#!/bin/sh
+#
+# luci.h5000m_upgrade — backend for the "固件升级" page in LuCI.
+#
+# Why this is a ubus plugin with a detached worker rather than one blocking
+# call: the image is ~80 MB.  A ubus call that sits there for a minute is cut
+# off by uhttpd long before the download finishes, and LuCI's fs.exec has the
+# same ceiling.  So `start` spawns a detached worker that survives the reply,
+# and the view polls `status` for progress.
+#
+# Nothing is ever flashed on faith:
+#   * the manifest is fetched from the SAME host as the package repository
+#     (the one address this device has proven it can reach without a proxy);
+#   * the image is checked against the sha256 in that manifest with sha256sum;
+#   * `flash` re-reads the digest off the staged file before calling
+#     sysupgrade, because the last thing between a corrupted download and a
+#     half-written flash should not be a value this script wrote itself.
+# A mismatch aborts and leaves the running system untouched.
+#
+# Configuration is preserved on purpose: sysupgrade is called WITHOUT -n, so
+# /etc/config, the AdGuard Home work_dir and the PassWall nodes come across via
+# keep.d.  `-n` must never appear in this file.
+#
+# The image lives under /tmp (tmpfs, ~490 MB on this device) for two reasons:
+# it is the one directory sysupgrade can use in place without first copying the
+# file, and the overlay is inside the very partition a sysupgrade rewrites, so
+# staging the image there would be reading from a filesystem being overwritten.
+
+. "$IPKG_INSTROOT/usr/share/libubox/jshn.sh"
+
+BASE_DIR="/tmp/h5000m-upgrade"
+STATUS="$BASE_DIR/status"
+PIDFILE="$BASE_DIR/worker.pid"
+
+# ------------------------------------------------------------------ helpers --
+
+# The revision the RUNNING SYSTEM was built from.
+#
+# Not /etc/openwrt_release: DISTRIB_REVISION there is produced by
+# scripts/getver.sh against a shallow clone with no tags, so it is `r0-<7 hex>`
+# while the published manifest carries the full 40-char commit.  Comparing the
+# two would offer an update on every single check.  /etc/h5000m-build-id is
+# written by the build from the exact resolved revision and is replaced (not
+# preserved) by sysupgrade, so this is the authoritative value.
+installed_revision() {
+	sed -n 's/^revision=//p' /etc/h5000m-build-id 2>/dev/null | head -n1
+}
+
+current_revision() {
+	( . /etc/openwrt_release 2>/dev/null; printf '%s' "${DISTRIB_REVISION:-unknown}" )
+}
+
+# Where the upgrade manifest lives.  Three sources, most specific first:
+#   1. uci, so a user can point the device at a mirror without rebuilding;
+#   2. /etc/h5000m-upgrade.url, written by the build from H5000M_APK_REPO_URL;
+#   3. derived from the apk source entry, which is the same host by
+#      construction — so an image that can install packages can also upgrade.
+base_url() {
+	local u
+	u="$(uci -q get h5000m_upgrade.main.base_url 2>/dev/null)"
+	[ -n "$u" ] || u="$(sed -n '1p' /etc/h5000m-upgrade.url 2>/dev/null)"
+	[ -n "$u" ] || u="$(sed -n 's#/packages\.adb[[:space:]]*$##p' \
+		/etc/apk/repositories.d/50-h5000m.list 2>/dev/null | head -n1)"
+	printf '%s' "${u%/}"
+}
+
+status_write() {
+	local st="$1"
+	shift
+	mkdir -p "$BASE_DIR" 2>/dev/null
+	{
+		printf 'state=%s\n' "$st"
+		local kv
+		for kv in "$@"; do printf '%s\n' "$kv"; done
+	} >"$STATUS.new" 2>/dev/null && mv -f "$STATUS.new" "$STATUS" 2>/dev/null
+	return 0
+}
+
+status_get() {
+	sed -n "s/^$1=//p" "$STATUS" 2>/dev/null | head -n1
+}
+
+status_int() {
+	local v
+	v="$(status_get "$1")"
+	case "$v" in
+		''|*[!0-9]*) printf '0' ;;
+		*) printf '%s' "$v" ;;
+	esac
+}
+
+worker_pid() {
+	cat "$PIDFILE" 2>/dev/null
+}
+
+# /proc/<pid>, not `ps | grep`: a grep pattern matches the shell that ran the
+# grep itself, which has produced a false "still running" here before.
+worker_alive() {
+	local p st
+	case "$(status_get state)" in
+		downloading|verifying) ;;
+		*) return 1 ;;
+	esac
+	p="$(worker_pid)"
+	[ -n "$p" ] && [ -d "/proc/$p" ]
+}
+
+json_msg() {
+	json_init
+	json_add_boolean ok "$1"
+	json_add_string message "$2"
+	json_dump
+}
+
+# Strip surrounding whitespace.  A url that arrives with a trailing space from a
+# paste would otherwise build ".../firmware/latest.json " and 404.
+trim() {
+	local s
+	s="$(printf '%s' "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+	printf '%s' "$s"
+}
+
+downloaded_bytes() {
+	if [ -f "$BASE_DIR/fw.bin.part" ]; then
+		wc -c <"$BASE_DIR/fw.bin.part" 2>/dev/null | tr -d ' '
+	elif [ -f "$BASE_DIR/fw.bin" ]; then
+		wc -c <"$BASE_DIR/fw.bin" 2>/dev/null | tr -d ' '
+	else
+		printf '0'
+	fi
+}
+
+# ------------------------------------------------------------------- worker --
+
+run_worker() {
+	local base="$1"
+	local manifest="$BASE_DIR/latest.json"
+	local part="$BASE_DIR/fw.bin.part"
+	local img="$BASE_DIR/fw.bin"
+	local rev='' sha='' fname='' fsize='' got=''
+
+	mkdir -p "$BASE_DIR"
+	# Own pid, written by the worker itself: `setsid ... &` can fork, so the
+	# parent's $! is not reliably the downloader's pid.
+	echo $$ >"$PIDFILE"
+	exec >"$BASE_DIR/worker.log" 2>&1
+
+	status_write downloading message="正在获取升级清单" percent=0
+	rm -f "$manifest" "$part" "$img"
+
+	if ! wget -q -T 30 -O "$manifest" "${base}/firmware/latest.json"; then
+		status_write error message="无法获取升级清单（${base}/firmware/latest.json）"
+		rm -f "$PIDFILE"
+		return 1
+	fi
+
+	json_load "$(cat "$manifest" 2>/dev/null)"
+	json_get_var rev revision
+	json_select sysupgrade >/dev/null 2>&1
+	json_get_var sha sha256
+	json_get_var fname file
+	json_get_var fsize size
+	json_select ".." >/dev/null 2>&1
+
+	if [ -z "$fname" ] || [ -z "$sha" ]; then
+		status_write error message="升级清单缺少镜像名或 sha256，已中止"
+		rm -f "$PIDFILE"
+		return 1
+	fi
+
+	status_write downloading message="正在下载 ${fname}" percent=0 \
+		total="${fsize:-0}" sha256="$sha" revision="$rev"
+
+	if ! wget -q -T 60 -O "$part" "${base}/firmware/${fname}"; then
+		status_write error message="下载失败：网络中断或地址不可达"
+		rm -f "$part" "$PIDFILE"
+		return 1
+	fi
+
+	status_write verifying message="正在校验 sha256" percent=100 total="${fsize:-0}"
+	got="$(sha256sum "$part" 2>/dev/null | cut -d' ' -f1)"
+	if [ -z "$got" ] || [ "$got" != "$sha" ]; then
+		rm -f "$part" "$PIDFILE"
+		status_write error message="校验失败，镜像已丢弃（期望 ${sha}，实际 ${got:-空}）"
+		return 1
+	fi
+
+	mv -f "$part" "$img"
+	rm -f "$PIDFILE"
+	status_write ready message="下载完成，校验通过" percent=100 \
+		total="${fsize:-0}" sha256="$sha" revision="$rev" file="$img"
+	return 0
+}
+
+# ------------------------------------------------------------------- methods --
+
+do_status() {
+	local got total rev
+	got="$(downloaded_bytes)"
+	total="$(status_int total)"
+	rev="$(installed_revision)"
+	[ -n "$rev" ] || rev="$(current_revision)"
+	json_init
+	json_add_boolean ok 1
+	json_add_string current_revision "$rev"
+	json_add_string display_revision "$(current_revision)"
+	json_add_string base_url "$(base_url)"
+	json_add_string state "$(status_get state)"
+	json_add_string message "$(status_get message)"
+	json_add_int percent "$(status_int percent)"
+	json_add_int total "$total"
+	json_add_int received "${got:-0}"
+	json_add_string sha256 "$(status_get sha256)"
+	json_add_string revision "$(status_get revision)"
+	json_add_boolean worker_running "$(worker_alive && printf 1 || printf 0)"
+	json_dump
+}
+
+do_check() {
+	local base manifest cur latest upd
+	base="$(base_url)"
+	mkdir -p "$BASE_DIR"
+
+	json_init
+	json_add_string base_url "$base"
+	cur="$(installed_revision)"
+	[ -n "$cur" ] || cur="$(current_revision)"
+	json_add_string current_revision "$cur"
+	json_add_string display_revision "$(current_revision)"
+
+	if [ -z "$base" ]; then
+		json_add_boolean ok 0
+		json_add_string message "未配置升级源地址（可用 uci set h5000m_upgrade.main.base_url=… 指定）"
+		json_dump
+		return
+	fi
+
+	manifest="$BASE_DIR/latest.json"
+	if ! wget -q -T 20 -O "$manifest.peer" "${base}/firmware/latest.json"; then
+		rm -f "$manifest.peer"
+		json_add_boolean ok 0
+		json_add_string message "无法获取升级清单，请检查网络或源地址"
+		json_dump
+		return
+	fi
+	mv -f "$manifest.peer" "$manifest"
+
+	json_load "$(cat "$manifest" 2>/dev/null)"
+	json_get_var latest revision
+	json_select sysupgrade >/dev/null 2>&1
+	json_get_var fsize size
+	json_get_var sha sha256
+	json_get_var fname file
+	json_select ".." >/dev/null 2>&1
+	json_get_var lkern kernel_version
+	json_get_var ldate build_date
+
+	if [ -z "$latest" ]; then
+		json_add_boolean ok 0
+		json_add_string message "清单内容无法解析"
+		json_dump
+		return
+	fi
+
+	if [ "$latest" = "$cur" ]; then upd=0; else upd=1; fi
+
+	json_add_boolean ok 1
+	json_add_boolean update_available "$upd"
+	json_add_string latest_revision "$latest"
+	json_add_string latest_kernel "$lkern"
+	json_add_string latest_date "$ldate"
+	json_add_string latest_file "$fname"
+	json_add_string latest_sha256 "$sha"
+	json_add_int latest_size "${fsize:-0}"
+	json_dump
+}
+
+do_start() {
+	local base
+
+	base="$(trim "$1")"
+	[ -n "$base" ] || base="$(base_url)"
+	base="${base%/}"
+
+	if [ -z "$base" ]; then
+		json_msg 0 "未配置升级源地址"
+		return
+	fi
+	if worker_alive; then
+		json_msg 0 "已有一个下载任务在进行"
+		return
+	fi
+
+	mkdir -p "$BASE_DIR"
+	rm -f "$BASE_DIR/fw.bin" "$BASE_DIR/fw.bin.part" "$PIDFILE"
+	status_write downloading message="准备中" percent=0
+
+	# Detached: this reply has to reach the browser, and the download outlives
+	# the ubus call by a wide margin.
+	setsid /bin/sh "$0" worker "$base" </dev/null >/dev/null 2>&1 &
+
+	json_msg 1 "已开始下载"
+}
+
+do_flash() {
+	local img want got
+
+	img="$(status_get file)"
+	want="$(status_get sha256)"
+
+	if [ "$(status_get state)" != "ready" ] || [ -z "$img" ] || [ ! -f "$img" ]; then
+		json_msg 0 "没有已就绪的镜像，请先下载"
+		return
+	fi
+
+	got="$(sha256sum "$img" 2>/dev/null | cut -d' ' -f1)"
+	if [ -z "$want" ] || [ -z "$got" ] || [ "$got" != "$want" ]; then
+		status_write error message="刷写前复验失败，已拒绝"
+		json_msg 0 "刷写前复验失败，已拒绝（镜像可能损坏）"
+		return
+	fi
+
+	status_write flashing message="正在刷写，设备即将重启" percent=100 \
+		file="$img" sha256="$want"
+
+	# Delayed so this reply is on the wire before the reboot drops the
+	# connection; detached so rpcd exiting cannot take the upgrade with it.
+	setsid /bin/sh -c "sleep 2; /sbin/sysupgrade '$img'" </dev/null \
+		>"$BASE_DIR/flash.log" 2>&1 &
+
+	json_msg 1 "已开始刷写，设备将在约一分钟后重启"
+}
+
+do_cancel() {
+	local p
+	p="$(worker_pid)"
+	if [ -n "$p" ] && [ -d "/proc/$p" ]; then
+		kill "$p" 2>/dev/null
+	fi
+	rm -f "$BASE_DIR/fw.bin.part" "$PIDFILE"
+	status_write idle message="已取消" percent=0
+	json_msg 1 "已取消下载"
+}
+
+# --------------------------------------------------------------------- main --
+
+case "$1" in
+	list)
+		json_init
+		json_add_object status
+		json_close_object
+		json_add_object check
+		json_close_object
+		json_add_object start
+		json_add_string url "url"
+		json_close_object
+		json_add_object flash
+		json_close_object
+		json_add_object cancel
+		json_close_object
+		json_dump
+		json_cleanup
+		;;
+	call)
+		case "$2" in
+			status|progress)
+				do_status
+				;;
+			check)
+				do_check
+				;;
+			start)
+				read -r input
+				json_init
+				json_load "$input"
+				json_get_var url url
+				json_cleanup
+				do_start "$url"
+				;;
+			flash)
+				read -r input
+				do_flash
+				;;
+			cancel)
+				read -r input
+				do_cancel
+				;;
+		esac
+		;;
+	worker)
+		shift
+		run_worker "$@"
+		;;
+esac

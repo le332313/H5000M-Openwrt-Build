@@ -2031,8 +2031,8 @@ install_local_packages() {
 	write_h5000m_runtime_config
 }
 
-# Two files the firmware needs at runtime, generated from build inputs rather
-# than committed as constants:
+# Files the firmware needs at runtime, generated from build inputs rather than
+# committed as constants:
 #
 #   /etc/h5000m-defaults.conf       the first-boot SSID/key/country and the
 #                                   hardware-offload switches
@@ -2040,6 +2040,13 @@ install_local_packages() {
 #                                   this project's own apk repository, so the
 #                                   service packages (=m) and every kmod can be
 #                                   installed on the running router
+#   /etc/h5000m-upgrade.url         where the one-click upgrade page fetches
+#                                   firmware/latest.json from — the same host as
+#                                   the apk repository, because that is the one
+#                                   address this device has already proven it
+#                                   can reach without a proxy
+#   /etc/h5000m-build-id            the exact upstream revision this image was
+#                                   built from
 #
 # They are written into the staged package's files/ tree, which is what the
 # OpenWrt build copies into the image.  Doing it here keeps the package itself
@@ -2049,6 +2056,8 @@ write_h5000m_runtime_config() {
 	local pkg_dir="${SRC}/package/h5000m-integration"
 	local repo_dir="${pkg_dir}/files/etc/apk/repositories.d"
 	local conf="${pkg_dir}/files/etc/h5000m-defaults.conf"
+	local upd_url="${pkg_dir}/files/etc/h5000m-upgrade.url"
+	local build_id="${pkg_dir}/files/etc/h5000m-build-id"
 
 	[ -d "$pkg_dir" ] || return 0
 
@@ -2102,12 +2111,36 @@ EOF
 			printf '%s/packages.adb\n' "${H5000M_APK_REPO_URL%/}"
 		} >"${repo_dir}/50-h5000m.list"
 		log "Firmware apk source: ${H5000M_APK_REPO_URL%/}/packages.adb"
+
+		# The web upgrade channel is published next to the repository, so the
+		# base URL is the same string with the index filename stripped.  Kept in
+		# its own one-line file rather than in uci: it is a build input, not a
+		# user setting, and it should be replaced (not preserved) by the next
+		# build.  /etc/h5000m-upgrade.url is deliberately absent from every
+		# keep.d, so sysupgrade brings the NEW build's value across; the rpcd
+		# backend still lets `h5000m_upgrade.main.base_url` override it.
+		printf '%s\n' "${H5000M_APK_REPO_URL%/}" >"${upd_url}"
+		log "Firmware upgrade source: ${H5000M_APK_REPO_URL%/}/firmware/latest.json"
 	else
 		# No URL configured.  Remove any file a previous run left behind rather
 		# than ship entries pointing at a host that does not exist.
-		rm -f "${repo_dir}/50-h5000m.list"
+		rm -f "${repo_dir}/50-h5000m.list" "${upd_url}"
 		log "Firmware apk source: none configured (set H5000M_APK_REPO_URL to add one)"
 	fi
+
+	# The exact upstream revision this image was built from.
+	#
+	# The one-click upgrade page cannot use /etc/openwrt_release for this: that
+	# carries DISTRIB_REVISION, which scripts/getver.sh derives from a shallow
+	# clone with no tags and is therefore `r0-<7 hex chars>` — while the
+	# manifest published by CI carries the full 40-char commit.  Comparing the
+	# two would report an update on every check, forever.  A dedicated file with
+	# the full revision makes the comparison exact.
+	{
+		printf 'revision=%s\n' "$(cat "${ROOT_DIR}/.upstream-revision" 2>/dev/null || echo unknown)"
+		printf 'describe=%s\n' "$(cat "${ROOT_DIR}/.upstream-describe" 2>/dev/null || echo unknown)"
+		printf 'built=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	} >"${build_id}"
 
 	return 0
 }

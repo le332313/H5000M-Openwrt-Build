@@ -1,0 +1,8 @@
+{
+	"admin/system/h5000m-upgrade": {
+		"title": "固件升级",
+		"order": 90,
+		"action": { "type": "view", "path": "h5000m/upgrade" },
+		"depends": { "acl": [ "luci-app-h5000m-upgrade" ] }
+	}
+}
