@@ -3800,15 +3800,25 @@ build_required_packages() {
 			#   is not optional: a REQUIRED_PACKAGES entry that does not exist is
 			#   a build failure four hours in, and the audit's own list contained
 			#   five names this feed does not have — luci-app-zerotier,
-			#   qfirehose, wrtbwmon, kmod-fs-ntfs3, ntfs3-mount.  None of them is
-			#   here, and the panel's ZeroTier page is driven by higorosd, so the
-			#   bare `zerotier` daemon is the whole fix for that one.
+			#   qfirehose, wrtbwmon, kmod-fs-ntfs3, ntfs3-mount.  wrtbwmon is
+			#   not a missing package but a missing overlay: the vendor rootfs
+			#   ships it and higorosd's traffic pages call luci.wrtbwmon and
+			#   read /tmp/usage.db, so it is restored file-by-file under
+			#   higoros-overlay/ instead.  The panel's ZeroTier page is driven
+			#   by higorosd, so the bare `zerotier` daemon is the whole fix for
+			#   that one.
 			#
 			#   kmod-fs-ksmbd is likewise absent: 6.18 builds the module in, and
 			#   ksmbd-server is the userspace half that is actually missing.
 			ksmbd-server luci-app-ksmbd
 			zerotier
 			luci-app-watchcat
+			# iptables-nft: the vendor image ships the IPv4 command and the
+			# overlay's wrtbwmon accounts traffic through it (wrtbwmon is a
+			# pure shell script over `iptables -t RRDIPT`).  Present in the
+			# feed index; ip6tables-nft was already pulled in, so this only
+			# adds the IPv4 half.
+			iptables-nft
 			ddns-scripts luci-app-ddns
 			# Disk management.  luci-app-diskman is already in the image; without
 			# these its partition and format dialogs fail on a missing binary.
