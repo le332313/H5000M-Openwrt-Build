@@ -3367,11 +3367,33 @@ EOF
 	# project's apk repository, so the device installs them with a plain
 	# `apk add`.
 	#
-	# `emit_service ""` keeps them at the repository mode ("m") even when
-	# ENABLE_REPO_PACKAGES is off, because that switch would otherwise set the
-	# mode to "n" and the repository would be missing exactly the packages it
-	# exists to carry.  The two ENABLE_PASSWALL* switches are the real control;
-	# both default to true.
+	# ★ 2026-10-13: passwall (v1) is baked into the IMAGE, not just the
+	# repository.  This block used to be `emit_service ""` — repository-only
+	# ("m") — on the reasoning that the front-end is a per-owner choice a plain
+	# `apk add` installs afterwards.  A real flash exposed the flaw: packages
+	# installed by hand live in the OVERLAY, and on this board the overlay does
+	# not survive a flash — it is carved out of the rootfs partition itself
+	# (see the `emmc_copy_config` note in /lib/upgrade/emmc.sh, which dd's the
+	# config tarball to the block right after the squashfs).  The app vanished
+	# while keep.d kept its /etc/config entry, so /etc/init.d/passwall still ran
+	# against a missing binary and the page 404'd — silent, not loud.
+	#
+	# The owner treats AdGuard Home and PassWall as services that must survive
+	# an update, so their binaries belong in the image.  Their CONFIGURATION
+	# still travels across a flash through keep.d (luci-app-passwall keeps
+	# /etc/config/passwall and /etc/passwall/, adguardhome keeps
+	# /etc/adguardhome/adguardhome.yaml), so a reflash comes back up already
+	# configured; only the binaries ever needed rescuing.
+	#
+	# passwall2 keeps the "" form on purpose: it is not in use here, and leaving
+	# it at "m" is what keeps luci-app-passwall2 in the repository, which
+	# verify-apk-repo.sh's FRONTENDS list requires unconditionally.
+	#
+	# If you revert the two `true` below to "", remember what "" means: it holds
+	# the mode at the ENABLE_REPO_PACKAGES default — "m", or "n" when that switch
+	# is off, which is the case the "" form existed to dodge (a "n" package is
+	# not built at all, so the repository would be missing exactly the packages
+	# it exists to carry).  Naming the switch directly cannot produce "n".
 	#
 	# Both the apps and their cores are listed.  The apps declare their cores
 	# through `+xray-core` / `+sing-box`, and a `+dep` inside a package that is
@@ -3392,7 +3414,7 @@ EOF
 	# switch is OFF — i.e. exactly for the configuration most people run.  Same
 	# trap as the checksum loop above.
 	if is_true "$ENABLE_PASSWALL"; then
-		emit_service "" luci-app-passwall luci-i18n-passwall-zh-cn
+		emit_service true luci-app-passwall luci-i18n-passwall-zh-cn
 	fi
 	if is_true "$ENABLE_PASSWALL2"; then
 		emit_service "" luci-app-passwall2 luci-i18n-passwall2-zh-cn
@@ -3439,8 +3461,16 @@ EOF
 	# died on the qmodem check before the emitted-name guard below was ever
 	# reached; the moment qmodem survived, the guard caught it.  See also the
 	# note on the nftables-json emit near the top of this function.
+	# ★ Same 2026-10-13 decision as the app above: the cores go into the IMAGE
+	# too, not just the repository.  An app baked in while its cores stay at "m"
+	# is the worst of both — the page renders, the node cannot start — and two
+	# entries below (kmod-nft-tproxy, kmod-nft-socket) are KERNEL modules that
+	# can only ever come from a repository built against this exact kernel, so
+	# they must ride in the image for the same reason the proxy-kmod block
+	# further down spells out.  The switch still gates everything: with both
+	# front-ends off this block emits nothing.
 	if is_true "$ENABLE_PASSWALL" || is_true "$ENABLE_PASSWALL2"; then
-		emit_service "" \
+		emit_service true \
 			xray-core sing-box \
 			geoview v2ray-geoip v2ray-geosite \
 			chinadns-ng hysteria \

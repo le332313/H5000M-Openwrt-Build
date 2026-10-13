@@ -23,6 +23,33 @@
 #     第二次开机起必然生效（与原有的隐式机制行为一致）。
 [ -x /etc/init.d/qmodem-rescan ] && /etc/init.d/qmodem-rescan enable
 
+# 1d) 流量统计 wrtbwmon —— 镜像只提供文件，不会自动建开机链接。
+#     原厂靠出厂时就存在的 /etc/rc.d/S99wrtbwmon；我们的 overlay 是纯文件级复制，
+#     必须显式 enable。它驱动 HigoOS 的「流量统计」页与 higorosd 的
+#     /devices/traffic/ranking。
+#     wrtbwmon 是纯 shell，账本走 `iptables -t RRDIPT`；iptables-nft 由
+#     REQUIRED_PACKAGES 带进镜像（缺它时脚本"成功"但永远只记 0 字节）。
+#     ★ 它只修流量统计本身 —— 2026-10-13 实测：补上 iptables 并 enable 本服务后，
+#     /devices 仍返回空列表，设备发现的缺失另有原因，别把这条当成那个修复。
+[ -x /etc/init.d/wrtbwmon ] && /etc/init.d/wrtbwmon enable
+
+# 1e) AdGuard Home —— 保命服务之一，无条件建开机链接。
+#     二进制已编进镜像（build.yml 的 ENABLE_ADGUARDHOME）。
+#     未走过初始化向导时它只监听 Web(3000)，不监听 5335，也不会碰 dnsmasq ——
+#     这一点是实测过的（2026-10-13 装机时 :::3000 在听、53 未被动过），
+#     所以全新刷机也能安全 enable。
+#     /etc/rc.d/ 不在任何 keep.d 的保护范围内，升级后链接必丢，必须在这里补。
+[ -x /etc/init.d/adguardhome ] && /etc/init.d/adguardhome enable
+
+# 1f) PassWall —— 保命服务之二，但**只在确实已经配置过节点时才建开机链接**。
+#     包自带的默认 /etc/config/passwall 是 `enabled '1'` 且一个节点都没有；
+#     而"无节点时走一遍启动流程会不会改写 dnsmasq 上游"我没有实测依据，
+#     万一会，那就是"刷完机 DNS 直接不通"的坑。用"存在节点 section"把它挡在外面，
+#     代价只是全新刷机后要在 LuCI 里手动点一次启动；升级场景则有节点 ⇒ 正常自启。
+if [ -f /etc/config/passwall ] && [ "$(uci -q show passwall 2>/dev/null | grep -c '=nodes')" -gt 0 ]; then
+    /etc/init.d/passwall enable
+fi
+
 # 2) 若底座带了其他风扇后台，禁掉，避免两个控制器抢 pwm
 #    （海狗页 + /usr/bin/fancontrol v2 是唯一管理者）
 for SVC in h5000m-fancontrol fancontrol-h5000m; do
@@ -81,5 +108,30 @@ fi
 uci -q set wireless.radio0.country='CN' 2>/dev/null
 uci -q set wireless.radio1.country='CN' 2>/dev/null
 uci -q commit wireless 2>/dev/null
+
+# 7) AdGuard Home 接管 LAN 的 DNS —— **只在 AGH 已经初始化过时**才动手。
+#
+#    AGH 刚装好、还没走过初始化向导时，/etc/adguardhome/adguardhome.yaml 不存在，
+#    5335 端口也就没人监听。此时若把「53 -> 5335」的劫持规则装上，等于把全屋 DNS
+#    指向一个空端口 —— 直接断网，比不装还糟。所以两条动作都以 yaml 存在为前提。
+#
+#    升级场景下 yaml 由 keep.d(adguardhome) 保留，于是规则与这个开关都自动恢复；
+#    全新刷机则保持 dnsmasq 直连的干净默认状态，等用户配好 AGH 后再生效。
+#
+#    本脚本跑在 /etc/init.d/boot(START=10) 内，早于 firewall(START=19)，
+#    所以复制完不需要额外 fw4 reload —— firewall 起来时会 include 到它。
+if [ -s /etc/adguardhome/adguardhome.yaml ]; then
+    # 7a) 安装 nft 劫持规则（priority -160，早于 PassWall 的 -151）
+    if [ -f /etc/adguardhome/20-adguard-dns.nft ]; then
+        mkdir -p /etc/nftables.d
+        cp -f /etc/adguardhome/20-adguard-dns.nft /etc/nftables.d/20-adguard-dns.nft
+    fi
+    # 7b) 让 PassWall 别再抢 53：它默认 dns_redirect=1 会把 53 截到自己的
+    #     chinadns-ng，与 AGH 的劫持互相打架（也只有 AGH 在用时才需要关）。
+    if [ -f /etc/config/passwall ]; then
+        uci -q set passwall.@global[0].dns_redirect='0'
+        uci -q commit passwall
+    fi
+fi
 
 exit 0

@@ -1,0 +1,26 @@
+## AdGuard Home —— LAN 的 DNS 劫持规则（H5000M / WorkBuddy 项目）
+##
+## LAN 客户端发往 53 的查询先交给 AdGuard Home(5335)，再由它按自己的上游分流。
+##
+## 优先级 -160 是**必须**的：PassWall 的 prerouting filter 链是 mangle-1 = -151，
+## 数值越小越早。若本链晚于 -151，PassWall 的 dns_redirect 会先把 53 截走，
+## AGH 就永远看不到查询。
+##
+## 本文件由 fw4 include 在 `table inet fw4` 上下文内（见 /etc/nftables.d/README），
+## 所以这里**只能写链，不能再套一层 `table inet fw4 {}`** —— 套了会变成嵌套
+## table 而静默失效（这正是从 iStoreOS 搬过来的老配方写法在本树上的坑）。
+##
+## 生效路径：/etc/uci-defaults/99-higoros-2512.sh 在首次启动时把它复制到
+## /etc/nftables.d/，且**仅当 /etc/adguardhome/adguardhome.yaml 已存在**时才复制 ——
+## AGH 未初始化时 5335 没人监听，装上规则等于把全屋 DNS 指向一个空端口。
+## 升级场景下 yaml 由 keep.d(adguardhome) 保留，规则随之自动恢复。
+##
+## 停用：rm -f /etc/nftables.d/20-adguard-dns.nft && fw4 reload
+
+chain adguard_dns_prerouting {
+	type nat hook prerouting priority -160; policy accept;
+	iifname "br-lan" meta nfproto ipv4 udp dport 53 counter redirect to :5335
+	iifname "br-lan" meta nfproto ipv4 tcp dport 53 counter redirect to :5335
+	iifname "br-lan" meta nfproto ipv6 udp dport 53 counter redirect to :5335
+	iifname "br-lan" meta nfproto ipv6 tcp dport 53 counter redirect to :5335
+}

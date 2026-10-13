@@ -430,7 +430,17 @@ jobs:
           ENABLE_OPENCLASH: ${{ vars.ENABLE_OPENCLASH || 'false' }}
           ENABLE_MOSDNS: 'true'
           ENABLE_HOMEPROXY: 'false'
-          ENABLE_ADGUARDHOME: ${{ vars.ENABLE_ADGUARDHOME || 'false' }}
+          # ★ 2026-10-13: default flipped false -> true.  AdGuard Home is one
+          # of the two services this device must keep across an update, and the
+          # binaries a user installs by hand live in the overlay — which this
+          # board loses on every flash (it is carved out of the rootfs
+          # partition; see /lib/upgrade/emmc.sh).  Baked in, it survives.  Its
+          # configuration always did survive, through keep.d's `adguardhome`
+          # entry (/etc/adguardhome/adguardhome.yaml).
+          #
+          # Still a variable, so `vars.ENABLE_ADGUARDHOME=false` turns it off
+          # again without touching this file.
+          ENABLE_ADGUARDHOME: ${{ vars.ENABLE_ADGUARDHOME || 'true' }}
           # Passwall / Passwall2 — the front-ends and the whole core set they
           # depend on, built into this project's own apk repository so a single
           # `apk add luci-app-passwall` on the device is all it takes.
