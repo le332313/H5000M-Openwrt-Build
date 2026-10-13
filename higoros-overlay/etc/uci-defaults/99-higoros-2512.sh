@@ -134,4 +134,28 @@ if [ -s /etc/adguardhome/adguardhome.yaml ]; then
     fi
 fi
 
+# 8) AGH 的工作目录从 tmpfs 挪到持久位置 —— **无条件执行，不看是否已初始化**。
+#
+#    默认 work_dir=/var/lib/adguardhome，而 /var 是指向 /tmp 的软链（tmpfs）
+#    ⇒ 每次重启整个目录清空。清空后 AGH 启动时要去下载屏蔽列表，而那一刻
+#    chinadns-ng(15353) 常常还没起来 ⇒ 下载失败，且 AGH 不会重试 ⇒
+#    规则表是空的 ⇒ **去广告静默失效**：DNS 照通、页面照开，只有广告不拦。
+#
+#    2026-10-13 刷机后实测踩到：www.baidu.com / www.google.com 解析正常，
+#    而 doubleclick.net 返回 142.250.x.x 真地址（升级前是 0.0.0.0）。
+#    日志铁证 —— filtering: updating filter url=... err="resolving ...
+#    exchanging with 127.0.0.1:15353 ... connection refused"，prev_rules_count=0。
+#
+#    为什么不放在上面的 if 块里：全新刷机时 adguardhome.yaml 尚不存在（用户还没
+#    走初始化向导），放进去就漏了这一支 —— 等用户配好 AGH、再一重启，同样中招。
+#    所以这里只看「包在不在」，与是否已初始化无关。
+#
+#    配套 keep.d 条目见 higoros-overlay/lib/upgrade/keep.d/adguardhome-work：
+#    重启靠 overlay 持久，刷机靠 keep.d 携带，两条路都不再需要
+#    「启动后立刻联网下载」，竞态无从发生。
+if [ -f /etc/config/adguardhome ]; then
+    uci -q set adguardhome.config.work_dir='/etc/adguardhome/work'
+    uci -q commit adguardhome
+fi
+
 exit 0
