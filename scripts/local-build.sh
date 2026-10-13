@@ -2045,8 +2045,10 @@ install_local_packages() {
 #                                   the apk repository, because that is the one
 #                                   address this device has already proven it
 #                                   can reach without a proxy
-#   /etc/h5000m-build-id            the exact upstream revision this image was
-#                                   built from
+#   /etc/h5000m-build-id            what this image IS: the upstream revision
+#                                   it was built from AND this repository's
+#                                   commit, because a pinned build reuses the
+#                                   revision across builds
 #
 # They are written into the staged package's files/ tree, which is what the
 # OpenWrt build copies into the image.  Doing it here keeps the package itself
@@ -2128,17 +2130,39 @@ EOF
 		log "Firmware apk source: none configured (set H5000M_APK_REPO_URL to add one)"
 	fi
 
-	# The exact upstream revision this image was built from.
+	# What this image is, for the one-click upgrade page to compare against.
 	#
-	# The one-click upgrade page cannot use /etc/openwrt_release for this: that
-	# carries DISTRIB_REVISION, which scripts/getver.sh derives from a shallow
-	# clone with no tags and is therefore `r0-<7 hex chars>` — while the
-	# manifest published by CI carries the full 40-char commit.  Comparing the
-	# two would report an update on every check, forever.  A dedicated file with
-	# the full revision makes the comparison exact.
+	# The one-click upgrade page cannot use /etc/openwrt_release for the
+	# revision: that carries DISTRIB_REVISION, which scripts/getver.sh derives
+	# from a shallow clone with no tags and is therefore `r0-<7 hex chars>` —
+	# while the manifest published by CI carries the full 40-char commit.
+	# Comparing the two would report an update on every check, forever.  A
+	# dedicated file with the full revision makes the comparison exact.
+	#
+	# ★ The revision on its own is still not an identity, and a `pinned` build
+	#   proves it: it compiles OPENWRT_PINNED_REVISION, so every pinned build a
+	#   day apart carries the SAME revision while their contents differ — this
+	#   overlay is most of what changes between them.  A page comparing
+	#   revisions alone answers "already up to date" and the new image can never
+	#   be reached from the browser.  Measured on 2026-10-13: the pin and the
+	#   revision on the router were both 404823678f, and a firmware carrying a
+	#   whole new upgrade page looked identical to the one already installed.
+	#
+	#   The build repository's own commit moves whenever anything that goes into
+	#   the image moves (overlay, config, patches, feeds.conf), so it is the
+	#   missing half.  GITHUB_SHA first because that is what the CI job actually
+	#   checked out; the local `rev-parse` covers a build outside Actions, and
+	#   `unknown` keeps the file parseable rather than writing an empty field.
+	local build_commit
+	build_commit="${GITHUB_SHA:-}"
+	if [ -z "$build_commit" ]; then
+		build_commit="$(git -C "${ROOT_DIR}" rev-parse HEAD 2>/dev/null || true)"
+	fi
+	[ -n "$build_commit" ] || build_commit=unknown
 	{
 		printf 'revision=%s\n' "$(cat "${ROOT_DIR}/.upstream-revision" 2>/dev/null || echo unknown)"
 		printf 'describe=%s\n' "$(cat "${ROOT_DIR}/.upstream-describe" 2>/dev/null || echo unknown)"
+		printf 'commit=%s\n' "$build_commit"
 		printf 'built=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 	} >"${build_id}"
 

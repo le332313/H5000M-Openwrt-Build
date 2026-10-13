@@ -46,12 +46,29 @@ installed_revision() {
 	sed -n 's/^revision=//p' /etc/h5000m-build-id 2>/dev/null | head -n1
 }
 
+# The build repository's commit this image was built from — the other half of
+# the identity.  See the update test in do_check() for why the revision alone
+# is not one.
+installed_build_commit() {
+	sed -n 's/^commit=//p' /etc/h5000m-build-id 2>/dev/null | head -n1
+}
+
+# When the image was staged.  Shown in the page so that "已是最新" is something
+# the user can check by eye instead of having to trust.
+installed_built() {
+	sed -n 's/^built=//p' /etc/h5000m-build-id 2>/dev/null | head -n1
+}
+
 current_revision() {
 	( . /etc/openwrt_release 2>/dev/null; printf '%s' "${DISTRIB_REVISION:-unknown}" )
 }
 
 # Where the upgrade manifest lives.  Three sources, most specific first:
-#   1. uci, so a user can point the device at a mirror without rebuilding;
+#   1. uci, so a user can point the device at a mirror without rebuilding.
+#      This only works because the image ships /etc/config/h5000m_upgrade: with
+#      no such file, `uci set h5000m_upgrade.main.base_url=…` answers
+#      "Entry not found" and the override is silently unavailable.  Verified on
+#      hardware on 2026-10-13, which is why the file is in the overlay.
 #   2. /etc/h5000m-upgrade.url, written by the build from H5000M_APK_REPO_URL;
 #   3. derived from the apk source entry, which is the same host by
 #      construction — so an image that can install packages can also upgrade.
@@ -217,7 +234,7 @@ do_status() {
 }
 
 do_check() {
-	local base manifest cur latest upd
+	local base manifest cur latest upd lcommit icomp
 	base="$(base_url)"
 	mkdir -p "$BASE_DIR"
 
@@ -254,6 +271,7 @@ do_check() {
 	json_select ".." >/dev/null 2>&1
 	json_get_var lkern kernel_version
 	json_get_var ldate build_date
+	json_get_var lcommit build_commit
 
 	if [ -z "$latest" ]; then
 		json_add_boolean ok 0
@@ -262,7 +280,31 @@ do_check() {
 		return
 	fi
 
-	if [ "$latest" = "$cur" ]; then upd=0; else upd=1; fi
+	# An update is offered when the running image is not the published one —
+	# on EITHER half of the identity.
+	#
+	# ★ The revision alone was wrong, and wrong in the direction that hides a
+	#   release.  A `pinned` build compiles OPENWRT_PINNED_REVISION every time,
+	#   so every pinned build carries the SAME revision while its contents
+	#   move — this overlay is most of what changes between them.  On
+	#   2026-10-13 the pin was 404823678f and so was the router, so a firmware
+	#   carrying a brand-new upgrade page was reported as `已是最新` and could
+	#   not be installed from the browser at all.  The build commit is the half
+	#   that actually moves; see installed_build_commit().
+	#
+	# "Different ⇒ offer", with no attempt to order the two.  A manifest that
+	# is merely older offers a re-install, which the user can ignore; the
+	# opposite error offers nothing and has no workaround from the page.  An
+	# ordering test would need a real timestamp in the manifest, and build_date
+	# carries only a date, so same-day builds would compare as equal.
+	icomp="$(installed_build_commit)"
+	if [ "$latest" != "$cur" ]; then
+		upd=1
+	elif [ -n "$lcommit" ] && [ "$lcommit" != "$icomp" ]; then
+		upd=1
+	else
+		upd=0
+	fi
 
 	json_add_boolean ok 1
 	json_add_boolean update_available "$upd"
@@ -272,6 +314,9 @@ do_check() {
 	json_add_string latest_file "$fname"
 	json_add_string latest_sha256 "$sha"
 	json_add_int latest_size "${fsize:-0}"
+	json_add_string latest_build_commit "$lcommit"
+	json_add_string installed_build_commit "$icomp"
+	json_add_string installed_built "$(installed_built)"
 	json_dump
 }
 

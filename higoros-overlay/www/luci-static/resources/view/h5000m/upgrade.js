@@ -135,11 +135,18 @@ return view.extend({
 		var ck = this.ck || {};
 
 		var upd = ck.update_available;
+		/* 上游 revision 相同却提示有更新，看着像矛盾，其实是最常见的一种情况：
+		   pinned 构建每次都编同一个 upstream revision，真正在动的是构建仓自己
+		   的提交（overlay/配置/补丁）。这里明说，省得被当成误报。 */
+		var sameRev = upd && ck.latest_revision ===
+			(st.current_revision || ck.current_revision);
 		var badge;
 		if (!ck.ok)
 			badge = this.badge(false, ck.message || _('未知'));
 		else if (upd)
-			badge = this.badge(false, _('有新版本'));
+			badge = this.badge(false, sameRev
+				? _('有新版本（上游版本相同，镜像内容已更新）')
+				: _('有新版本'));
 		else
 			badge = this.badge(true, _('已是最新'));
 
@@ -148,9 +155,15 @@ return view.extend({
 			E('table', { 'class': 'table' }, [
 				this.row(_('当前版本'), shortRev(st.current_revision || ck.current_revision)),
 				this.row(_('当前发布号'), st.display_revision),
+				this.row(_('当前镜像构建于'), ck.installed_built),
 				this.row(_('最新版本'), shortRev(ck.latest_revision) + ' '),
 				this.row(_('内核'), ck.latest_kernel),
 				this.row(_('发布时间'), ck.latest_date),
+				/* 版本判定的依据。摆出来是为了让"已是最新"可以被核对：只看
+				   revision 会漏掉"同一上游版本的新镜像"，那正是升级页存在的
+				   意义。 */
+				this.row(_('构建提交'), shortRev(ck.installed_build_commit) + ' → ' +
+					shortRev(ck.latest_build_commit)),
 				this.row(_('镜像大小'), fmtBytes(ck.latest_size)),
 				this.row(_('状态'), E('span', {}, [ badge ]))
 			])

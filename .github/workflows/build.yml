@@ -1166,6 +1166,12 @@ jobs:
       # up unchanged; it already uploads that whole directory.
       - name: Stage the firmware for the web upgrade channel
         if: success()
+        env:
+          # Passed through the environment rather than interpolated into the
+          # script below — the same rule the oras step follows.  A commit id is
+          # not attacker-influenced, but keeping the rule uniform is cheaper
+          # than remembering which of the two github.* values are safe.
+          BUILD_COMMIT: ${{ github.sha }}
         run: |
           set -euo pipefail
           fwdir="artifacts/apk-repo/firmware"
@@ -1202,6 +1208,15 @@ jobs:
           # advertised as flashable; the initramfs is the recovery path and is
           # uploaded by hand through the U-Boot failsafe page.
           #
+          # ★ build_commit is not decoration.  `revision` alone cannot say
+          #   whether two images are the same: a `pinned` run compiles
+          #   OPENWRT_PINNED_REVISION every time, so the revision is identical
+          #   across builds while the overlay changes.  The device compares both,
+          #   and refuses to call an image "already installed" on the revision
+          #   matching when the build commit does not.  Without it, this very
+          #   channel published a firmware carrying a new upgrade page that the
+          #   router reported as "已是最新" and would not install.
+          #
           # The Python body sits at the same indentation as the shell lines so
           # that YAML's block-scalar stripping leaves it flush left — a heredoc
           # terminator with leading whitespace is not a terminator.
@@ -1222,6 +1237,7 @@ jobs:
               "kernel_version": os.environ["KVER"],
               "kernel_abi": os.environ["ABI"],
               "build_date": os.environ["BDATE"],
+              "build_commit": os.environ["BUILD_COMMIT"],
               "sysupgrade": {
                   "file": os.environ["FNAME"],
                   "size": int(os.environ["FSIZE"]),
