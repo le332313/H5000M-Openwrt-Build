@@ -291,6 +291,20 @@ CLONED_PACKAGE_DIRS=()
 # bare names no package ever had, and every build dropped all three silently.
 EMITTED_PACKAGES=()
 
+# Packages already promised to the IMAGE (=y).  Kconfig resolves a repeated
+# `CONFIG_PACKAGE_x` key by taking the LAST one, so an `=m` emitted further down
+# silently overwrites an `=y` emitted earlier — the package then builds into the
+# repository and never into the image, with nothing red anywhere.
+#
+# Measured on run 38368496523 (2026-10-13): luci-app-passwall was emitted =y at
+# line 3417 and =m again at line 3690, so the image shipped xray-core and
+# sing-box but NO passwall — the cores rode in while the app stayed behind,
+# i.e. exactly the "page installs, node cannot start" shape this project has
+# already shipped once.  Same cause, five more packages (chinadns-ng, geoview,
+# hysteria, dns2socks, ipt2socks, tcping).  emit_service() now makes =y sticky;
+# see the note there.
+declare -A EMITTED_IMAGE=()
+
 # ------------------------------------------------- first-boot product setup ---
 # Applied once by /usr/sbin/h5000m-firstboot (uci-defaults + ieee80211 hotplug)
 # and written into the image as /etc/h5000m-defaults.conf.
@@ -3252,15 +3266,42 @@ EOF
 	is_true "$ENABLE_REPO_PACKAGES" || service_pkg_mode="n"
 
 	# emit_service <switch-value> <package>...
+	# ★ `=y` is sticky.  Kconfig takes the LAST value for a repeated key, so a
+	# repository-only write that comes later in this file silently demotes a
+	# package already promised to the image — no error, no warning, the package
+	# merely turns up only in the repository.  See EMITTED_IMAGE at the top.
+	#
+	# Measured 2026-10-13 (run 38368496523): the passwall app and its cores are
+	# emitted =y here, then the "third-party proxy frontends" and "passwall
+	# cores" blocks further down emit the same names as =m.  Result on the
+	# built image: xray-core and sing-box present (they appear only in this
+	# block), luci-app-passwall / chinadns-ng / geoview absent (they appear in
+	# a later =m block too).  "Half of one emit list made it" was the symptom.
+	#
+	# So an =m request for a name already asked for as =y is dropped.  The
+	# semantics are unchanged for every package that was never asked for as =y,
+	# and "in the image" is the stronger promise of the two — it must win on its
+	# own merits, not on which line happens to sit lower.  The name is still
+	# recorded in EMITTED_PACKAGES once, from the =y write, so the "every
+	# emitted name must exist upstream" check keeps covering it.
 	emit_service() {
 		local on="$1"
 		shift
 		local mode="$service_pkg_mode"
 		local pkg
 		is_true "$on" && mode="y"
+		if [ "$mode" != "y" ]; then
+			for pkg in "$@"; do
+				[ "${EMITTED_IMAGE[$pkg]:-0}" = "1" ] && continue
+				printf 'CONFIG_PACKAGE_%s=%s\n' "$pkg" "$mode" >>"$out"
+				EMITTED_PACKAGES+=("$pkg")
+			done
+			return 0
+		fi
 		for pkg in "$@"; do
-			printf 'CONFIG_PACKAGE_%s=%s\n' "$pkg" "$mode" >>"$out"
+			printf 'CONFIG_PACKAGE_%s=y\n' "$pkg" >>"$out"
 			EMITTED_PACKAGES+=("$pkg")
+			EMITTED_IMAGE[$pkg]=1
 		done
 	}
 
@@ -3670,10 +3711,22 @@ EOF
 		kmod-ipt-filter
 
 	# ------------------------------------------- third-party proxy frontends ---
-	# Built into the repository, never installed.  Package names are taken from
-	# the build system's own tmp/.packageinfo rather than guessed from the
-	# Makefiles: these are LuCI apps whose package name comes from the directory,
-	# so grepping for `define Package/` finds nothing.
+	# Built into the repository, never installed — EXCEPT the ones emitted =y
+	# higher up.  luci-app-passwall (ENABLE_PASSWALL on) is one of the two
+	# services that has to survive a flash, so it belongs in the image and the
+	# =m written on the line below is dropped for it.  Package names are taken
+	# from the build system's own tmp/.packageinfo rather than guessed from the
+	# Makefiles: these are LuCI apps whose package name comes from the
+	# directory, so grepping for `define Package/` finds nothing.
+	#
+	# ★ A name that appears BOTH here and in an =y block keeps the =y.
+	# emit_service makes the image promise sticky, because a repeated
+	# CONFIG_PACKAGE key is resolved by kconfig taking the LAST one — measured
+	# 2026-10-13, when exactly that demoted luci-app-passwall back to =m and
+	# the image shipped xray-core and sing-box but no passwall at all.  The
+	# list below is left as it is on purpose: with ENABLE_PASSWALL off this
+	# block is the only write, and the package still has to reach the
+	# repository.
 	#
 	# The daemon, its LuCI app AND its Chinese translation are all listed.  A user
 	# who runs `apk add luci-app-passwall` and gets a UI with no Chinese is the
@@ -3729,6 +3782,13 @@ EOF
 
 	# Cores and helpers PassWall/PassWall2/HiJpass need that the official feeds do
 	# not carry, from the pruned openwrt-passwall-packages checkout.
+	#
+	# ★ The ones the image needs — chinadns-ng, geoview, hysteria, dns2socks,
+	# ipt2socks, tcping — are also emitted =y higher up, and that wins (see the
+	# sticky-=y note on emit_service).  Without the cores riding along, an app
+	# that does reach the image is a panel that cannot start a node.
+	# The rest stay repository-only, which is what keeps the image from
+	# carrying every protocol core the front-end could ever want.
 	emit_service "" \
 		chinadns-ng dns2socks geoview hysteria ipt2socks naiveproxy \
 		shadow-tls tcping v2ray-plugin xray-plugin \
@@ -4329,7 +4389,16 @@ verify_config() {
 	# Front-ends and services that belong to the repository must still be there
 	# after the final defconfig — see assert_repo_only.  The unconditional
 	# front-ends first, then each optional service whose switch is off.
-	for fe in luci-app-passwall luci-app-passwall2 luci-app-ssr-plus \
+	#
+	# ★ luci-app-passwall moved OUT of the unconditional list on 2026-10-13.
+	# It used to be asserted repository-only on every build.  With
+	# ENABLE_PASSWALL on it is emitted =y on purpose (it is one of the two
+	# services that has to survive a flash), so the assertion would now fire on
+	# the very image this project means to build.  It follows the same
+	# "switch on => in the image, switch off => repository-only" shape as
+	# adguardhome a few lines below.
+	is_true "$ENABLE_PASSWALL" || assert_repo_only luci-app-passwall
+	for fe in luci-app-passwall2 luci-app-ssr-plus \
 		luci-app-momo luci-app-fchomo luci-app-nekobox luci-app-xray \
 		luci-app-hijpass luci-app-v2raya luci-app-adblock-fast; do
 		assert_repo_only "$fe"
