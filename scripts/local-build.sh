@@ -361,6 +361,24 @@ ARGON_THEME_REPO_BRANCH="${ARGON_THEME_REPO_BRANCH:-master}"
 ARGON_CONFIG_REPO_URL="${ARGON_CONFIG_REPO_URL:-https://github.com/jerrykuku/luci-app-argon-config.git}"
 ARGON_CONFIG_REPO_BRANCH="${ARGON_CONFIG_REPO_BRANCH:-master}"
 
+# iStore (linkease's app store) — the on-device software store the user asked
+# for.  Like Argon it is in no feed, so it is cloned in.  One repo carries all
+# four packages under luci/; the buildroot's package discovery walks subdirs
+# recursively (the stock tree itself has three-level packages, e.g.
+# firmware/linux-firmware), and fix_mirror_hashes scans Makefiles to depth 4,
+# which still covers package/istore/luci/<pkg>/Makefile.
+#
+# The package ships its own runtime plumbing when built with apk: the istore
+# signing key and repositories.d/compat.list (see src/root-apk/), so the store
+# can install apps from istore.istoreos.com at runtime without extra config.
+# Verified live 2026-10-14: that repo serves 823 packages and apk on this
+# device verifies it with the shipped istore.pem; a full --simulate of
+# luci-app-store resolves 16 packages cleanly.  The 网络向导 (luci-app-quickstart)
+# is NOT bakeable: its `quickstart` backend binary exists in no reachable repo.
+ENABLE_ISTORE="${ENABLE_ISTORE:-true}"
+ISTORE_REPO_URL="${ISTORE_REPO_URL:-https://github.com/linkease/istore.git}"
+ISTORE_REPO_BRANCH="${ISTORE_REPO_BRANCH:-main}"
+
 # ------------------------------------------------------------- run modes -----
 INSTALL_DEPS=false
 PREPARE_ONLY="${PREPARE_ONLY:-false}"
@@ -649,7 +667,7 @@ show_features() {
 	log "Upstream      : ${REPO_URL} (${REPO_BRANCH}, track=${OPENWRT_TRACK})"
 	log "Target        : ${TARGET_BOARD}/${TARGET_SUBTARGET} profile=${TARGET_PROFILE}"
 	log "Board stack   : fancontrol=${ENABLE_FANCONTROL} netmode=${ENABLE_NETMODE} wwand=${ENABLE_WWAND} mt5700m=${ENABLE_MT5700M} qmodem=${ENABLE_QMODEM} oaf=${ENABLE_OAF} higoros=${ENABLE_HIGOROS}"
-	log "UI            : argon=${ENABLE_THEME_ARGON}"
+	log "UI            : argon=${ENABLE_THEME_ARGON} istore=${ENABLE_ISTORE}"
 	# Say plainly whether the default network is open — "encryption=none" is
 	# easy to miss in a build log and this is a security-relevant default.
 	if [ "${H5000M_WIFI_ENCRYPTION}" = 'none' ]; then
@@ -2426,6 +2444,32 @@ install_theme() {
 	return 0
 }
 
+# iStore: one repo, four packages under luci/.  Clone the repo whole rather
+# than copying subdirs out: keeping it a single git tree keeps `git fetch`
+# updates working and lets fix_mirror_hashes (maxdepth 4) reach every Makefile.
+# Fatal on failure for the same reason as install_theme: REQUIRED_PACKAGES
+# names these four, so a silent clone failure would resurface as an opaque
+# defconfig complaint instead of a network error here.
+install_istore() {
+	if ! is_true "$ENABLE_ISTORE"; then
+		log "iStore disabled (ENABLE_ISTORE=false) — no on-device app store"
+		return 0
+	fi
+
+	clone_external istore "$ISTORE_REPO_URL" "$ISTORE_REPO_BRANCH" ||
+		die "Could not fetch istore from ${ISTORE_REPO_URL}"
+
+	# Belt and braces: fail now, in seconds, if the repo layout ever moves,
+	# instead of as an unknown-package defconfig complaint minutes later.
+	local pkg
+	for pkg in luci-app-store luci-lib-taskd luci-lib-xterm taskd; do
+		[ -f "${SRC}/package/istore/luci/${pkg}/Makefile" ] ||
+			die "istore clone is missing luci/${pkg}/Makefile — upstream layout changed"
+	done
+
+	return 0
+}
+
 # Clone one optional third-party package on behalf of an ENABLE_* switch.
 #
 # The switch name is part of the failure message on purpose.  Under `set -e` a
@@ -3879,6 +3923,13 @@ build_required_packages() {
 	is_true "$ENABLE_WWAND" && REQUIRED_PACKAGES+=(wwand wwand-qmi wwand-ncm wwand-mbim luci-app-wwand luci-proto-wwand)
 	is_true "$ENABLE_MT5700M" && REQUIRED_PACKAGES+=(luci-app-mt5700m ubus-at-daemon sms-tool_q)
 	is_true "$ENABLE_THEME_ARGON" && REQUIRED_PACKAGES+=(luci-theme-argon luci-app-argon-config)
+	# luci-compat: the store package is the lua-era layout (controller/store.lua,
+	# view/store/main.htm — verified live from the prebuilt package), and 25.12
+	# ships no lua runtime.  This mirrors linkease's own installer, which pulls
+	# luci-compat whenever /usr/lib/lua/luci/cbi.lua is missing.  Without it the
+	# package installs cleanly but no menu entry ever appears — the page 404s
+	# with no error anywhere.
+	is_true "$ENABLE_ISTORE" && REQUIRED_PACKAGES+=(luci-app-store luci-lib-taskd luci-lib-xterm taskd luci-compat)
 	REQUIRED_PACKAGES+=(h5000m-integration luci-app-h5000m-accel kmod-tcp-bbr
 		kmod-nft-socket kmod-nft-tproxy
 		# kmod-veth carries the Nikki-RS eBPF datapath's dae0/dae0peer link
@@ -5076,6 +5127,7 @@ main() {
 	# the run in minutes instead of after a four-hour compile.
 	bake_modem_support
 	install_theme
+	install_istore
 	stage_higoros_overlay
 	install_external_packages
 	# After install_external_packages, which is what clones OpenWrt-nikki-rs —
