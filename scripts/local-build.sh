@@ -379,6 +379,26 @@ ENABLE_ISTORE="${ENABLE_ISTORE:-true}"
 ISTORE_REPO_URL="${ISTORE_REPO_URL:-https://github.com/linkease/istore.git}"
 ISTORE_REPO_BRANCH="${ISTORE_REPO_BRANCH:-main}"
 
+# Tailscale：这台机器在 5G CGNAT 后面（运营商给的是 10.x 私网地址，没有公网
+# 端口可映射），远程访问只能靠组网穿透，Tailscale 是首选。两个包都在**官方源**
+# 里，不依赖任何第三方：
+#   * tailscale —— net/tailscale，2021 年就在 openwrt/packages 里；Go 源码编译，
+#     依赖只有 +ca-bundle +kmod-tun（kmod-tun 本来就在本镜像里）。
+#   * luci-app-tailscale-community —— applications/ 下，2026-01-23 加入；现代
+#     LuCI 形态（htdocs 视图 + menu.d + acl.d + ucode 后端），25.12 没有 lua
+#     不影响它；后端要的 rpcd-mod-ucode 镜像里已有。
+#
+# 烘进镜像前在设备上实测过（2026-10-14）：两包安装**零冲突、零降级**（LuCI 应用
+# 还依赖 ip-full，镜像里已装），九个文件全部落在下面闸门期望的位置，`ubus -v
+# list` 能看到 `tailscale` 对象，页面路由可达。
+# ★ 它**会自己开机自启**（装完就出现 S80tailscale），但未配置的守护进程是惰性的：
+#   实测在它运行且未登录时，`ip route` 与 `nft list ruleset` 里 tailscale 条目
+#   都是 0，默认路由仍是 5G（via wwan0_1）—— 在 `tailscale up` 之前不接管任何流量。
+# ★ 登录态不用我们操心：/etc/tailscale/ 是该包的 conffile，本平台安装时会自动
+#   生成 /lib/upgrade/keep.d/tailscale，sysupgrade 自己会把它带过去（实测），
+#   所以这里**故意不加** keep.d 条目。
+ENABLE_TAILSCALE="${ENABLE_TAILSCALE:-true}"
+
 # ------------------------------------------------------------- run modes -----
 INSTALL_DEPS=false
 PREPARE_ONLY="${PREPARE_ONLY:-false}"
@@ -667,7 +687,7 @@ show_features() {
 	log "Upstream      : ${REPO_URL} (${REPO_BRANCH}, track=${OPENWRT_TRACK})"
 	log "Target        : ${TARGET_BOARD}/${TARGET_SUBTARGET} profile=${TARGET_PROFILE}"
 	log "Board stack   : fancontrol=${ENABLE_FANCONTROL} netmode=${ENABLE_NETMODE} wwand=${ENABLE_WWAND} mt5700m=${ENABLE_MT5700M} qmodem=${ENABLE_QMODEM} oaf=${ENABLE_OAF} higoros=${ENABLE_HIGOROS}"
-	log "UI            : argon=${ENABLE_THEME_ARGON} istore=${ENABLE_ISTORE}"
+	log "UI            : argon=${ENABLE_THEME_ARGON} istore=${ENABLE_ISTORE} tailscale=${ENABLE_TAILSCALE}"
 	# Say plainly whether the default network is open — "encryption=none" is
 	# easy to miss in a build log and this is a security-relevant default.
 	if [ "${H5000M_WIFI_ENCRYPTION}" = 'none' ]; then
@@ -3930,6 +3950,10 @@ build_required_packages() {
 	# package installs cleanly but no menu entry ever appears — the page 404s
 	# with no error anywhere.
 	is_true "$ENABLE_ISTORE" && REQUIRED_PACKAGES+=(luci-app-store luci-lib-taskd luci-lib-xterm taskd luci-compat)
+	# Tailscale: daemon + LuCI page, both official.  See the block next to
+	# ENABLE_TAILSCALE above for why the page is bakeable on a lua-less 25.12
+	# and why an unconfigured daemon is inert.
+	is_true "$ENABLE_TAILSCALE" && REQUIRED_PACKAGES+=(tailscale luci-app-tailscale-community)
 	REQUIRED_PACKAGES+=(h5000m-integration luci-app-h5000m-accel kmod-tcp-bbr
 		kmod-nft-socket kmod-nft-tproxy
 		# kmod-veth carries the Nikki-RS eBPF datapath's dae0/dae0peer link
@@ -4058,6 +4082,7 @@ build_expected_packages() {
 	is_true "$ENABLE_OAF" && EXPECTED_PACKAGES+=(luci-i18n-oaf-zh-cn)
 	is_true "$ENABLE_UPNP" && EXPECTED_PACKAGES+=(luci-i18n-upnp-zh-cn)
 	is_true "$ENABLE_ADBLOCK" && EXPECTED_PACKAGES+=(luci-i18n-adblock-zh-cn)
+	is_true "$ENABLE_TAILSCALE" && EXPECTED_PACKAGES+=(luci-i18n-tailscale-community-zh-cn)
 	return 0
 }
 

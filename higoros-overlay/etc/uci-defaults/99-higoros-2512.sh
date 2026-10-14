@@ -50,6 +50,18 @@ if [ -f /etc/config/passwall ] && [ "$(uci -q show passwall 2>/dev/null | grep -
     /etc/init.d/passwall enable
 fi
 
+# 1g) Tailscale —— 远程访问（这台机器在 5G CGNAT 后面，没有公网端口可映射）。
+#     镜像已烘入 tailscale + luci-app-tailscale-community（build.yml 的
+#     ENABLE_TAILSCALE）。包安装时会自己建 S80 链接，但 /etc/rc.d/ 不在任何
+#     keep.d 的保护范围内，升级后链接必丢 ⇒ 在这里显式补上，不再依赖隐式行为。
+#     ★ 未登录的守护进程是惰性的（2026-10-14 实测：tailscaled 在跑但未登录时，
+#     `ip route` 与 `nft list ruleset` 里 tailscale 条目都是 0，默认路由仍是 5G
+#     via wwan0_1），所以全新刷机也能安全 enable；真正组网要等一次 `tailscale up`
+#     （在 LuCI 的「网络 → Tailscale」页填 auth key，或命令行给 authkey）。
+#     登录态在 /etc/tailscale/tailscaled.state，该目录是 tailscale 包的 conffile，
+#     本平台会自动生成 /lib/upgrade/keep.d/tailscale ⇒ 刷机不需要重新登录。
+[ -x /etc/init.d/tailscale ] && /etc/init.d/tailscale enable
+
 # 2) 若底座带了其他风扇后台，禁掉，避免两个控制器抢 pwm
 #    （海狗页 + /usr/bin/fancontrol v2 是唯一管理者）
 for SVC in h5000m-fancontrol fancontrol-h5000m; do

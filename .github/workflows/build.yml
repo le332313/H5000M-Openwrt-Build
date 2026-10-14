@@ -419,6 +419,7 @@ jobs:
           ENABLE_UPNP: 'true'
           ENABLE_THEME_ARGON: 'true'
           ENABLE_ISTORE: 'true'
+          ENABLE_TAILSCALE: 'true'
           ENABLE_ADBLOCK: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.enable_adblock) || 'false' }}
           ENABLE_REPO_PACKAGES: 'true'
           H5000M_APK_REPO_URL: ${{ vars.H5000M_APK_REPO_URL || '' }}
