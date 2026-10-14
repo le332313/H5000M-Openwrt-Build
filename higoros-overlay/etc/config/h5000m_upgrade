@@ -1,0 +1,17 @@
+# One-click firmware upgrade (LuCI: 系统 -> 固件升级).
+#
+# This file exists mostly so that `uci set` works at all: with no
+# /etc/config/h5000m_upgrade on the device, `uci set h5000m_upgrade.main.base_url=…`
+# fails with "Entry not found", which made the documented way to point the
+# router at a mirror unusable out of the box.  Found on 2026-10-13 while trying
+# to use it.
+#
+# /etc/config is in the default keep list, so an override set here survives
+# sysupgrade — which is the point: the build bakes its own source into
+# /etc/h5000m-upgrade.url (replaced by every flash), and this is where a user
+# overrides it in a way that sticks.
+#
+# Leave base_url unset to keep using the built-in source.
+
+config h5000m_upgrade 'main'
+	# option base_url 'https://example.invalid/H5000M-Openwrt-Build'

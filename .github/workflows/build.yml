@@ -418,6 +418,8 @@ jobs:
           ENABLE_MT5700M: ${{ vars.ENABLE_MT5700M || 'false' }}
           ENABLE_UPNP: 'true'
           ENABLE_THEME_ARGON: 'true'
+          ENABLE_ISTORE: 'true'
+          ENABLE_TAILSCALE: 'true'
           ENABLE_ADBLOCK: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.enable_adblock) || 'false' }}
           ENABLE_REPO_PACKAGES: 'true'
           H5000M_APK_REPO_URL: ${{ vars.H5000M_APK_REPO_URL || '' }}
@@ -1146,6 +1148,111 @@ jobs:
           echo "=== images ==="
           ls -la artifacts/ 2>/dev/null || true
 
+      # -----------------------------------------------------------------------
+      # Publish the firmware next to the package repository.
+      #
+      # The router can already reach this Pages site: the apk source baked into
+      # every image points here and `apk update` succeeds.  That makes it the
+      # one channel this device has DEMONSTRATED it can reach without a proxy —
+      # which is the whole reason the one-click upgrade page works at all.
+      #
+      # The device fetches firmware/latest.json, compares the revision with its
+      # own /etc/h5000m-build-id, downloads the image from the URL in that
+      # manifest and checks it against the sha256 there before touching flash.
+      #
+      # GitHub Releases also carries these images, but a release download
+      # redirects to objects.githubusercontent.com, which is routinely
+      # unreachable from inside China — the network this device actually sits on.
+      #
+      # The files are staged INTO apk-repo/ so the existing Pages job picks them
+      # up unchanged; it already uploads that whole directory.
+      - name: Stage the firmware for the web upgrade channel
+        if: success()
+        env:
+          # Passed through the environment rather than interpolated into the
+          # script below — the same rule the oras step follows.  A commit id is
+          # not attacker-influenced, but keeping the rule uniform is cheaper
+          # than remembering which of the two github.* values are safe.
+          BUILD_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          fwdir="artifacts/apk-repo/firmware"
+          mkdir -p "$fwdir"
+
+          sys="$(ls artifacts/*squashfs-sysupgrade.bin 2>/dev/null | head -n1 || true)"
+          ker="$(ls artifacts/*initramfs-kernel.bin 2>/dev/null | head -n1 || true)"
+          if [ -z "$sys" ]; then
+            echo "::error::no squashfs-sysupgrade image; the upgrade channel would be empty"
+            exit 1
+          fi
+
+          cp -f -- "$sys" "$fwdir/"
+          if [ -n "$ker" ]; then
+            cp -f -- "$ker" "$fwdir/"
+            # U-Boot's failsafe web UI gates its upload on the file NAME (it
+            # wants *.itb), so the recovery image ships under both extensions.
+            cp -f -- "$ker" "$fwdir/$(basename "${ker%-initramfs-kernel.bin}")-initramfs.itb"
+          fi
+          cp -f -- artifacts/BUILD-INFO.txt "$fwdir/"
+
+          # Checksum list over exactly what was staged, generated with find so an
+          # absent *.itb cannot turn the shell's literal glob into an argument
+          # and fail the step under `set -e`.  The sed normalises the `./` that
+          # find's -exec prefix produces, and the binary-mode `*` some sha256sum
+          # builds emit, so the file works with `sha256sum -c` anywhere.
+          ( cd "$fwdir" && find . -maxdepth 1 -type f \
+              \( -name '*.bin' -o -name '*.itb' \) -exec sha256sum {} + \
+              | sed 's#^\([0-9a-f]\{64\}\) [ *]\./#\1  #' >sha256sums.txt )
+
+          get() { sed -n "s/^$1=//p" artifacts/BUILD-INFO.txt | head -n1; }
+
+          # The manifest the device reads.  Only the sysupgrade image is
+          # advertised as flashable; the initramfs is the recovery path and is
+          # uploaded by hand through the U-Boot failsafe page.
+          #
+          # ★ build_commit is not decoration.  `revision` alone cannot say
+          #   whether two images are the same: a `pinned` run compiles
+          #   OPENWRT_PINNED_REVISION every time, so the revision is identical
+          #   across builds while the overlay changes.  The device compares both,
+          #   and refuses to call an image "already installed" on the revision
+          #   matching when the build commit does not.  Without it, this very
+          #   channel published a firmware carrying a new upgrade page that the
+          #   router reported as "已是最新" and would not install.
+          #
+          # The Python body sits at the same indentation as the shell lines so
+          # that YAML's block-scalar stripping leaves it flush left — a heredoc
+          # terminator with leading whitespace is not a terminator.
+          REV="$(get openwrt_revision)" \
+          CODE="$(get openwrt_version_code)" \
+          KVER="$(get kernel_version)" \
+          ABI="$(get kernel_abi)" \
+          SHA="$(sha256sum -- "$sys" | cut -d' ' -f1)" \
+          FNAME="$(basename "$sys")" \
+          FSIZE="$(stat -c%s "$sys")" \
+          BDATE="$(date -u +%Y-%m-%d)" \
+          python3 - "$fwdir/latest.json" <<'PY'
+          import json, os, sys
+          json.dump({
+              "project": "AutoBuild-H5000M-Openwrt",
+              "revision": os.environ["REV"],
+              "version_code": os.environ["CODE"],
+              "kernel_version": os.environ["KVER"],
+              "kernel_abi": os.environ["ABI"],
+              "build_date": os.environ["BDATE"],
+              "build_commit": os.environ["BUILD_COMMIT"],
+              "sysupgrade": {
+                  "file": os.environ["FNAME"],
+                  "size": int(os.environ["FSIZE"]),
+                  "sha256": os.environ["SHA"],
+                  "url": "firmware/" + os.environ["FNAME"],
+              },
+          }, open(sys.argv[1], "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+          PY
+          printf '\n' >>"$fwdir/latest.json"
+
+          cat "$fwdir/latest.json"
+          ls -l "$fwdir"
+
       # What the promotion job reads, and the reason it is an OUTPUT rather than
       # a downloaded artifact: BUILD-INFO.txt lives inside a ~250 MB firmware
       # artifact, and a promotion needs two short strings out of it.  Passing
@@ -1559,7 +1666,13 @@ jobs:
         run: |
           set -euo pipefail
           count="$(find apk-repo -maxdepth 1 -name '*.apk' | wc -l)"
-          size="$(du -sh apk-repo | cut -f1)"
+          # Measure the packages only.  `du -sh apk-repo` used to be the whole
+          # story, but the directory now also carries firmware/ (~140 MB), and
+          # reporting that as the size of the package repository would be wrong
+          # by two orders of magnitude.
+          size="$(du -ch apk-repo/*.apk 2>/dev/null | tail -n1 | cut -f1)"
+          fwsize="$(du -sh apk-repo/firmware 2>/dev/null | cut -f1 || echo '-')"
+          fwrev="$(sed -n 's/.*"revision": *"\([^"]*\)".*/\1/p' apk-repo/firmware/latest.json 2>/dev/null | head -n1)"
           cat > apk-repo/index.html <<EOF
           <!doctype html>
           <html lang="zh-CN">
@@ -1589,6 +1702,19 @@ jobs:
           apk add luci-app-passwall</pre>
             <p>可安装的代理面板包括 PassWall、PassWall2、HomeProxy、MosDNS、Nikki-RS、
                Momo、NeKoBox、v2rayA、OpenClash 以及各自的中文语言包。</p>
+
+            <h2>固件升级（一键）</h2>
+            <p>同一个站点的 <a href="firmware/">firmware/</a> 目录（${fwsize}）存放本项目的固件，
+               供路由器上的「系统 → 固件升级」页面直接下载刷写。当前清单版本：
+               <code>${fwrev:-未知}</code>。</p>
+            <ul>
+              <li>清单：<a href="firmware/latest.json">firmware/latest.json</a> —— 设备读它来比对版本</li>
+              <li>升级镜像：<code>firmware/&lt;名字&gt;-squashfs-sysupgrade.bin</code>（带 sha256 校验）</li>
+              <li>救援镜像：<code>firmware/&lt;名字&gt;-initramfs.itb</code> —— 内存启动，一字节不写 flash，
+                  用于 U-Boot failsafe（<code>http://192.168.9.1</code>）上传</li>
+              <li>校验清单：<a href="firmware/sha256sums.txt">firmware/sha256sums.txt</a></li>
+            </ul>
+            <p>一键升级只在设备自己比对 sha256 通过后才会刷写；校验不符会中止并保留原系统。</p>
           </body>
           </html>
           EOF

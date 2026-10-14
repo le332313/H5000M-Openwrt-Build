@@ -1,0 +1,12 @@
+# AdGuard Home 工作目录（屏蔽列表缓存、统计、会话）。
+#
+# 为什么要保留它：默认 work_dir=/var/lib/adguardhome 位于 tmpfs（/var -> /tmp），
+# 每次重启清空后 AGH 要重新下载屏蔽列表，而那一刻 chinadns-ng(15353) 往往还没起来
+# ⇒ 下载失败且不重试 ⇒ 去广告静默失效（DNS 照通、只是广告不拦）。
+# 2026-10-13 刷机后实测踩到（doubleclick.net 返回真实 IP）。
+#
+# 配合 uci-defaults 里把 work_dir 改到 /etc/adguardhome/work（见
+# higoros-overlay/etc/uci-defaults/99-higoros-2512.sh 第 7c 段）：
+# 重启时规则随 overlay 持久、直接加载，刷机时这份 keep.d 再把缓存带过去，
+# 两条路都不需要「启动后立刻联网下载」，竞态就无从发生。
+/etc/adguardhome/work

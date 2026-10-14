@@ -361,6 +361,44 @@ ARGON_THEME_REPO_BRANCH="${ARGON_THEME_REPO_BRANCH:-master}"
 ARGON_CONFIG_REPO_URL="${ARGON_CONFIG_REPO_URL:-https://github.com/jerrykuku/luci-app-argon-config.git}"
 ARGON_CONFIG_REPO_BRANCH="${ARGON_CONFIG_REPO_BRANCH:-master}"
 
+# iStore (linkease's app store) — the on-device software store the user asked
+# for.  Like Argon it is in no feed, so it is cloned in.  One repo carries all
+# four packages under luci/; the buildroot's package discovery walks subdirs
+# recursively (the stock tree itself has three-level packages, e.g.
+# firmware/linux-firmware), and fix_mirror_hashes scans Makefiles to depth 4,
+# which still covers package/istore/luci/<pkg>/Makefile.
+#
+# The package ships its own runtime plumbing when built with apk: the istore
+# signing key and repositories.d/compat.list (see src/root-apk/), so the store
+# can install apps from istore.istoreos.com at runtime without extra config.
+# Verified live 2026-10-14: that repo serves 823 packages and apk on this
+# device verifies it with the shipped istore.pem; a full --simulate of
+# luci-app-store resolves 16 packages cleanly.  The 网络向导 (luci-app-quickstart)
+# is NOT bakeable: its `quickstart` backend binary exists in no reachable repo.
+ENABLE_ISTORE="${ENABLE_ISTORE:-true}"
+ISTORE_REPO_URL="${ISTORE_REPO_URL:-https://github.com/linkease/istore.git}"
+ISTORE_REPO_BRANCH="${ISTORE_REPO_BRANCH:-main}"
+
+# Tailscale：这台机器在 5G CGNAT 后面（运营商给的是 10.x 私网地址，没有公网
+# 端口可映射），远程访问只能靠组网穿透，Tailscale 是首选。两个包都在**官方源**
+# 里，不依赖任何第三方：
+#   * tailscale —— net/tailscale，2021 年就在 openwrt/packages 里；Go 源码编译，
+#     依赖只有 +ca-bundle +kmod-tun（kmod-tun 本来就在本镜像里）。
+#   * luci-app-tailscale-community —— applications/ 下，2026-01-23 加入；现代
+#     LuCI 形态（htdocs 视图 + menu.d + acl.d + ucode 后端），25.12 没有 lua
+#     不影响它；后端要的 rpcd-mod-ucode 镜像里已有。
+#
+# 烘进镜像前在设备上实测过（2026-10-14）：两包安装**零冲突、零降级**（LuCI 应用
+# 还依赖 ip-full，镜像里已装），九个文件全部落在下面闸门期望的位置，`ubus -v
+# list` 能看到 `tailscale` 对象，页面路由可达。
+# ★ 它**会自己开机自启**（装完就出现 S80tailscale），但未配置的守护进程是惰性的：
+#   实测在它运行且未登录时，`ip route` 与 `nft list ruleset` 里 tailscale 条目
+#   都是 0，默认路由仍是 5G（via wwan0_1）—— 在 `tailscale up` 之前不接管任何流量。
+# ★ 登录态不用我们操心：/etc/tailscale/ 是该包的 conffile，本平台安装时会自动
+#   生成 /lib/upgrade/keep.d/tailscale，sysupgrade 自己会把它带过去（实测），
+#   所以这里**故意不加** keep.d 条目。
+ENABLE_TAILSCALE="${ENABLE_TAILSCALE:-true}"
+
 # ------------------------------------------------------------- run modes -----
 INSTALL_DEPS=false
 PREPARE_ONLY="${PREPARE_ONLY:-false}"
@@ -649,7 +687,7 @@ show_features() {
 	log "Upstream      : ${REPO_URL} (${REPO_BRANCH}, track=${OPENWRT_TRACK})"
 	log "Target        : ${TARGET_BOARD}/${TARGET_SUBTARGET} profile=${TARGET_PROFILE}"
 	log "Board stack   : fancontrol=${ENABLE_FANCONTROL} netmode=${ENABLE_NETMODE} wwand=${ENABLE_WWAND} mt5700m=${ENABLE_MT5700M} qmodem=${ENABLE_QMODEM} oaf=${ENABLE_OAF} higoros=${ENABLE_HIGOROS}"
-	log "UI            : argon=${ENABLE_THEME_ARGON}"
+	log "UI            : argon=${ENABLE_THEME_ARGON} istore=${ENABLE_ISTORE} tailscale=${ENABLE_TAILSCALE}"
 	# Say plainly whether the default network is open — "encryption=none" is
 	# easy to miss in a build log and this is a security-relevant default.
 	if [ "${H5000M_WIFI_ENCRYPTION}" = 'none' ]; then
@@ -2031,8 +2069,8 @@ install_local_packages() {
 	write_h5000m_runtime_config
 }
 
-# Two files the firmware needs at runtime, generated from build inputs rather
-# than committed as constants:
+# Files the firmware needs at runtime, generated from build inputs rather than
+# committed as constants:
 #
 #   /etc/h5000m-defaults.conf       the first-boot SSID/key/country and the
 #                                   hardware-offload switches
@@ -2040,6 +2078,15 @@ install_local_packages() {
 #                                   this project's own apk repository, so the
 #                                   service packages (=m) and every kmod can be
 #                                   installed on the running router
+#   /etc/h5000m-upgrade.url         where the one-click upgrade page fetches
+#                                   firmware/latest.json from — the same host as
+#                                   the apk repository, because that is the one
+#                                   address this device has already proven it
+#                                   can reach without a proxy
+#   /etc/h5000m-build-id            what this image IS: the upstream revision
+#                                   it was built from AND this repository's
+#                                   commit, because a pinned build reuses the
+#                                   revision across builds
 #
 # They are written into the staged package's files/ tree, which is what the
 # OpenWrt build copies into the image.  Doing it here keeps the package itself
@@ -2049,6 +2096,8 @@ write_h5000m_runtime_config() {
 	local pkg_dir="${SRC}/package/h5000m-integration"
 	local repo_dir="${pkg_dir}/files/etc/apk/repositories.d"
 	local conf="${pkg_dir}/files/etc/h5000m-defaults.conf"
+	local upd_url="${pkg_dir}/files/etc/h5000m-upgrade.url"
+	local build_id="${pkg_dir}/files/etc/h5000m-build-id"
 
 	[ -d "$pkg_dir" ] || return 0
 
@@ -2102,12 +2151,58 @@ EOF
 			printf '%s/packages.adb\n' "${H5000M_APK_REPO_URL%/}"
 		} >"${repo_dir}/50-h5000m.list"
 		log "Firmware apk source: ${H5000M_APK_REPO_URL%/}/packages.adb"
+
+		# The web upgrade channel is published next to the repository, so the
+		# base URL is the same string with the index filename stripped.  Kept in
+		# its own one-line file rather than in uci: it is a build input, not a
+		# user setting, and it should be replaced (not preserved) by the next
+		# build.  /etc/h5000m-upgrade.url is deliberately absent from every
+		# keep.d, so sysupgrade brings the NEW build's value across; the rpcd
+		# backend still lets `h5000m_upgrade.main.base_url` override it.
+		printf '%s\n' "${H5000M_APK_REPO_URL%/}" >"${upd_url}"
+		log "Firmware upgrade source: ${H5000M_APK_REPO_URL%/}/firmware/latest.json"
 	else
 		# No URL configured.  Remove any file a previous run left behind rather
 		# than ship entries pointing at a host that does not exist.
-		rm -f "${repo_dir}/50-h5000m.list"
+		rm -f "${repo_dir}/50-h5000m.list" "${upd_url}"
 		log "Firmware apk source: none configured (set H5000M_APK_REPO_URL to add one)"
 	fi
+
+	# What this image is, for the one-click upgrade page to compare against.
+	#
+	# The one-click upgrade page cannot use /etc/openwrt_release for the
+	# revision: that carries DISTRIB_REVISION, which scripts/getver.sh derives
+	# from a shallow clone with no tags and is therefore `r0-<7 hex chars>` —
+	# while the manifest published by CI carries the full 40-char commit.
+	# Comparing the two would report an update on every check, forever.  A
+	# dedicated file with the full revision makes the comparison exact.
+	#
+	# ★ The revision on its own is still not an identity, and a `pinned` build
+	#   proves it: it compiles OPENWRT_PINNED_REVISION, so every pinned build a
+	#   day apart carries the SAME revision while their contents differ — this
+	#   overlay is most of what changes between them.  A page comparing
+	#   revisions alone answers "already up to date" and the new image can never
+	#   be reached from the browser.  Measured on 2026-10-13: the pin and the
+	#   revision on the router were both 404823678f, and a firmware carrying a
+	#   whole new upgrade page looked identical to the one already installed.
+	#
+	#   The build repository's own commit moves whenever anything that goes into
+	#   the image moves (overlay, config, patches, feeds.conf), so it is the
+	#   missing half.  GITHUB_SHA first because that is what the CI job actually
+	#   checked out; the local `rev-parse` covers a build outside Actions, and
+	#   `unknown` keeps the file parseable rather than writing an empty field.
+	local build_commit
+	build_commit="${GITHUB_SHA:-}"
+	if [ -z "$build_commit" ]; then
+		build_commit="$(git -C "${ROOT_DIR}" rev-parse HEAD 2>/dev/null || true)"
+	fi
+	[ -n "$build_commit" ] || build_commit=unknown
+	{
+		printf 'revision=%s\n' "$(cat "${ROOT_DIR}/.upstream-revision" 2>/dev/null || echo unknown)"
+		printf 'describe=%s\n' "$(cat "${ROOT_DIR}/.upstream-describe" 2>/dev/null || echo unknown)"
+		printf 'commit=%s\n' "$build_commit"
+		printf 'built=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	} >"${build_id}"
 
 	return 0
 }
@@ -2365,6 +2460,32 @@ install_theme() {
 		die "Could not fetch luci-theme-argon from ${ARGON_THEME_REPO_URL}"
 	clone_external luci-app-argon-config "$ARGON_CONFIG_REPO_URL" "$ARGON_CONFIG_REPO_BRANCH" ||
 		die "Could not fetch luci-app-argon-config from ${ARGON_CONFIG_REPO_URL}"
+
+	return 0
+}
+
+# iStore: one repo, four packages under luci/.  Clone the repo whole rather
+# than copying subdirs out: keeping it a single git tree keeps `git fetch`
+# updates working and lets fix_mirror_hashes (maxdepth 4) reach every Makefile.
+# Fatal on failure for the same reason as install_theme: REQUIRED_PACKAGES
+# names these four, so a silent clone failure would resurface as an opaque
+# defconfig complaint instead of a network error here.
+install_istore() {
+	if ! is_true "$ENABLE_ISTORE"; then
+		log "iStore disabled (ENABLE_ISTORE=false) — no on-device app store"
+		return 0
+	fi
+
+	clone_external istore "$ISTORE_REPO_URL" "$ISTORE_REPO_BRANCH" ||
+		die "Could not fetch istore from ${ISTORE_REPO_URL}"
+
+	# Belt and braces: fail now, in seconds, if the repo layout ever moves,
+	# instead of as an unknown-package defconfig complaint minutes later.
+	local pkg
+	for pkg in luci-app-store luci-lib-taskd luci-lib-xterm taskd; do
+		[ -f "${SRC}/package/istore/luci/${pkg}/Makefile" ] ||
+			die "istore clone is missing luci/${pkg}/Makefile — upstream layout changed"
+	done
 
 	return 0
 }
@@ -3822,6 +3943,44 @@ build_required_packages() {
 	is_true "$ENABLE_WWAND" && REQUIRED_PACKAGES+=(wwand wwand-qmi wwand-ncm wwand-mbim luci-app-wwand luci-proto-wwand)
 	is_true "$ENABLE_MT5700M" && REQUIRED_PACKAGES+=(luci-app-mt5700m ubus-at-daemon sms-tool_q)
 	is_true "$ENABLE_THEME_ARGON" && REQUIRED_PACKAGES+=(luci-theme-argon luci-app-argon-config)
+	# luci-compat: the store package is the lua-era layout (controller/store.lua,
+	# view/store/main.htm — verified live from the prebuilt package), and 25.12
+	# ships no lua runtime.  This mirrors linkease's own installer, which pulls
+	# luci-compat whenever /usr/lib/lua/luci/cbi.lua is missing.  Without it the
+	# package installs cleanly but no menu entry ever appears — the page 404s
+	# with no error anywhere.
+	#
+	# ★ xz-utils and xz are not extras: without them luci-app-store never becomes
+	#   a selectable symbol at all, and it fails in the least readable way there
+	#   is — defconfig writes no line for it (a package whose prompt is invisible
+	#   is not "unset", it is absent), so the required-package gate fires on a
+	#   package that the graph never even offered.
+	#
+	#   Measured, run 38499063973 (2026-10-14), pinned feed packages=9f24e4f3:
+	#
+	#     luci-app-store  --select--> tar
+	#     utils/tar   DEPENDS:= ... +PACKAGE_TAR_XZ:xz
+	#     utils/tar   config PACKAGE_TAR_XZ ... default y
+	#     ⇒ the stanza the store inherits carries the gate
+	#         depends on !(PACKAGE_TAR_XZ) || PACKAGE_xz-utils
+	#         = !(y) || n = FALSE
+	#     ⇒ luci-app-store: stanza=1  .config=[<no line>]
+	#
+	#   `+PACKAGE_TAR_XZ:xz` is a *conditional* dependency, not a select: enabling
+	#   tar does not bring xz in.  Nothing in this config had ever asked for xz,
+	#   so the gate evaluated false.  Fix = name both packages here (they are
+	#   small, and image size is not what this build is short of).
+	#
+	#   Why both, when the gate only names xz-utils: in this feed revision
+	#   /usr/bin/xz — the binary `tar --with-xz=xz` actually execs — lives in the
+	#   BuildSubPackage `xz`, while `xz-utils` is the MENU metapackage whose
+	#   install is literally `true`.  xz-utils is what satisfies the gate by name;
+	#   xz is what makes the feature it was gating work.
+	is_true "$ENABLE_ISTORE" && REQUIRED_PACKAGES+=(luci-app-store luci-lib-taskd luci-lib-xterm taskd luci-compat xz-utils xz)
+	# Tailscale: daemon + LuCI page, both official.  See the block next to
+	# ENABLE_TAILSCALE above for why the page is bakeable on a lua-less 25.12
+	# and why an unconfigured daemon is inert.
+	is_true "$ENABLE_TAILSCALE" && REQUIRED_PACKAGES+=(tailscale luci-app-tailscale-community)
 	REQUIRED_PACKAGES+=(h5000m-integration luci-app-h5000m-accel kmod-tcp-bbr
 		kmod-nft-socket kmod-nft-tproxy
 		# kmod-veth carries the Nikki-RS eBPF datapath's dae0/dae0peer link
@@ -3950,6 +4109,7 @@ build_expected_packages() {
 	is_true "$ENABLE_OAF" && EXPECTED_PACKAGES+=(luci-i18n-oaf-zh-cn)
 	is_true "$ENABLE_UPNP" && EXPECTED_PACKAGES+=(luci-i18n-upnp-zh-cn)
 	is_true "$ENABLE_ADBLOCK" && EXPECTED_PACKAGES+=(luci-i18n-adblock-zh-cn)
+	is_true "$ENABLE_TAILSCALE" && EXPECTED_PACKAGES+=(luci-i18n-tailscale-community-zh-cn)
 	return 0
 }
 
@@ -5019,6 +5179,7 @@ main() {
 	# the run in minutes instead of after a four-hour compile.
 	bake_modem_support
 	install_theme
+	install_istore
 	stage_higoros_overlay
 	install_external_packages
 	# After install_external_packages, which is what clones OpenWrt-nikki-rs —
