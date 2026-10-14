@@ -1,5 +1,6 @@
 'use strict';
 'require view';
+'require dom';
 'require rpc';
 'require ui';
 
