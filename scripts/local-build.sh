@@ -3949,7 +3949,34 @@ build_required_packages() {
 	# luci-compat whenever /usr/lib/lua/luci/cbi.lua is missing.  Without it the
 	# package installs cleanly but no menu entry ever appears — the page 404s
 	# with no error anywhere.
-	is_true "$ENABLE_ISTORE" && REQUIRED_PACKAGES+=(luci-app-store luci-lib-taskd luci-lib-xterm taskd luci-compat)
+	#
+	# ★ xz-utils and xz are not extras: without them luci-app-store never becomes
+	#   a selectable symbol at all, and it fails in the least readable way there
+	#   is — defconfig writes no line for it (a package whose prompt is invisible
+	#   is not "unset", it is absent), so the required-package gate fires on a
+	#   package that the graph never even offered.
+	#
+	#   Measured, run 38499063973 (2026-10-14), pinned feed packages=9f24e4f3:
+	#
+	#     luci-app-store  --select--> tar
+	#     utils/tar   DEPENDS:= ... +PACKAGE_TAR_XZ:xz
+	#     utils/tar   config PACKAGE_TAR_XZ ... default y
+	#     ⇒ the stanza the store inherits carries the gate
+	#         depends on !(PACKAGE_TAR_XZ) || PACKAGE_xz-utils
+	#         = !(y) || n = FALSE
+	#     ⇒ luci-app-store: stanza=1  .config=[<no line>]
+	#
+	#   `+PACKAGE_TAR_XZ:xz` is a *conditional* dependency, not a select: enabling
+	#   tar does not bring xz in.  Nothing in this config had ever asked for xz,
+	#   so the gate evaluated false.  Fix = name both packages here (they are
+	#   small, and image size is not what this build is short of).
+	#
+	#   Why both, when the gate only names xz-utils: in this feed revision
+	#   /usr/bin/xz — the binary `tar --with-xz=xz` actually execs — lives in the
+	#   BuildSubPackage `xz`, while `xz-utils` is the MENU metapackage whose
+	#   install is literally `true`.  xz-utils is what satisfies the gate by name;
+	#   xz is what makes the feature it was gating work.
+	is_true "$ENABLE_ISTORE" && REQUIRED_PACKAGES+=(luci-app-store luci-lib-taskd luci-lib-xterm taskd luci-compat xz-utils xz)
 	# Tailscale: daemon + LuCI page, both official.  See the block next to
 	# ENABLE_TAILSCALE above for why the page is bakeable on a lua-less 25.12
 	# and why an unconfigured daemon is inert.
