@@ -38,10 +38,12 @@ MARKER_OFFLOAD='/etc/h5000m-offload-applied'
 # /etc/h5000m-defaults.conf at build time, so the SSID, key, country and the
 # offload switches are build inputs rather than constants.  The fallbacks keep
 # the script working if that file is ever missing.
-H5000M_WIFI_SSID='openwrt'
-H5000M_WIFI_KEY=''
+H5000M_WIFI_SSID='Higoros-H5000M'
+H5000M_WIFI_SSID_2G='Higoros-H5000M-2.4G'
+H5000M_WIFI_SSID_5G='Higoros-H5000M-5G'
+H5000M_WIFI_KEY='H987654321'
 H5000M_WIFI_COUNTRY='CN'
-H5000M_WIFI_ENCRYPTION='none'
+H5000M_WIFI_ENCRYPTION='sae-mixed'
 H5000M_WIFI_HTMODE_2G='EHT40'
 H5000M_WIFI_HTMODE_5G='EHT160'
 H5000M_FLOW_OFFLOAD='1'
@@ -64,15 +66,30 @@ log() { logger -t h5000m-firstboot "$@" 2>/dev/null || true; }
 configure_wireless() {
 	[ -f /etc/config/wireless ] || return 1
 
-	local iface radio band ssid configured=0 custom=0
+	local iface radio pkg dev band ssid configured=0 custom=0
 
+	# "Unconfigured" covers BOTH the factory names (OpenWrt ships with
+	# OpenWrt/openwrt/empty) AND every name this image can write on an earlier
+	# boot: the two per-band names AND the base name they are derived from.
+	#
+	# The base name is on that list because it is exactly what a half-applied
+	# state looks like — the SSID was set before the per-band split existed, or
+	# a run stopped between the two interfaces.  Leaving it off the list made
+	# the guard read it as "the owner's choice" and freeze the device on the
+	# base name for ever, silently: measured on real hardware, the run returned
+	# 1, wrote no marker, logged nothing, and the SSIDs never reached
+	# -2.4G/-5G.  An owner who sets an SSID that happens to equal the build's
+	# base name is far less likely than that state, and the change is visible.
 	for iface in $(uci -q show wireless | sed -n 's/^\(wireless\.[^.]*\)=wifi-iface$/\1/p'); do
 		[ "$(uci -q get "${iface}.mode")" = 'ap' ] || continue
 		ssid="$(uci -q get "${iface}.ssid" 2>/dev/null || true)"
-		case "$ssid" in
-			'' | OpenWrt | openwrt) configured=1 ;;
-			*) custom=1 ;;
-		esac
+		if [ -z "$ssid" ] || [ "$ssid" = 'OpenWrt' ] || [ "$ssid" = 'openwrt' ] ||
+			[ "$ssid" = "$H5000M_WIFI_SSID" ] ||
+			[ "$ssid" = "$H5000M_WIFI_SSID_2G" ] || [ "$ssid" = "$H5000M_WIFI_SSID_5G" ]; then
+			configured=1
+		else
+			custom=1
+		fi
 	done
 
 	[ "$custom" = '0' ] || return 1
@@ -90,10 +107,30 @@ configure_wireless() {
 
 	for iface in $(uci -q show wireless | sed -n 's/^\(wireless\.[^.]*\)=wifi-iface$/\1/p'); do
 		[ "$(uci -q get "${iface}.mode")" = 'ap' ] || continue
+
+		# The band is declared on the radio an interface sits on, reached through
+		# its `device`.  That option holds a BARE section name (`radio0`), which
+		# `uci get` cannot resolve by itself — it needs the package name, and
+		# that is the part of the interface's own name before the first dot.
+		# `uci -q get radio0.band` returns EMPTY (measured), which silently sent
+		# both bands to the fallback name below instead of failing.
+		# Deriving the package beats hardcoding "wireless.": the loop already
+		# works on fully-qualified names, and a hardcoded prefix goes stale the
+		# day the config moves.
+		pkg="${iface%%.*}"
+		dev="$(uci -q get "${iface}.device")"
+		band=''
+		[ -n "$dev" ] && band="$(uci -q get "${pkg}.${dev}.band")"
+		case "$band" in
+			2g) ssid="${H5000M_WIFI_SSID_2G}" ;;
+			5g) ssid="${H5000M_WIFI_SSID_5G}" ;;
+			*) ssid="${H5000M_WIFI_SSID}" ;;
+		esac
+
 		# bss_transition must stay unset: the official compact wpad variant
 		# does not know that hostapd option and rejects the whole AP config.
 		uci -q delete "${iface}.bss_transition"
-		uci -q set "${iface}.ssid=${H5000M_WIFI_SSID}"
+		uci -q set "${iface}.ssid=${ssid}"
 		uci -q set "${iface}.encryption=${H5000M_WIFI_ENCRYPTION}"
 
 		# An open network has no key and no management-frame protection: leaving
@@ -112,7 +149,7 @@ configure_wireless() {
 	done
 
 	uci -q commit wireless
-	log "wireless enabled: ssid=${H5000M_WIFI_SSID} country=${H5000M_WIFI_COUNTRY}"
+	log "wireless enabled: ssid2g=${H5000M_WIFI_SSID_2G} ssid5g=${H5000M_WIFI_SSID_5G} country=${H5000M_WIFI_COUNTRY} encryption=${H5000M_WIFI_ENCRYPTION}"
 	return 0
 }
 

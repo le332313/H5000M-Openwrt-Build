@@ -20,3 +20,20 @@ higoros-overlay/etc/init.d/** text eol=lf
 higoros-overlay/etc/uci-defaults/** text eol=lf
 higoros-overlay/etc/fw_env.config text eol=lf
 higoros-overlay/usr/bin/to-failsafe text eol=lf
+
+# local-packages: same reasoning as higoros-overlay — these files are installed
+# into the firmware and executed by the router's own shell.
+#
+# Why this needs saying: `* text=auto` alone leaves an extensionless script at
+# the mercy of the local checkout.  With core.autocrlf=true (the default on
+# Windows) `h5000m-firstboot` came out of the working tree with CRLF, and every
+# `do` became `do\r`.  The device's dash reports that as
+# `syntax error: unexpected word (expecting "do")`, so the first-boot script
+# does NOT die loudly — the shell never parses it, nothing enables the radios,
+# and a freshly flashed unit comes up with no WiFi at all and no error in any
+# log.  It was caught only because the file was run on a real device.
+#
+# Everything under local-packages/ is text (no binaries today); if one is ever
+# added, switch this to the higoros-overlay shape above — a blanket `-text`
+# first, then explicit eol=lf lines for the files that must be LF on the router.
+local-packages/** text eol=lf

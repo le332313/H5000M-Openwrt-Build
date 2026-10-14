@@ -311,17 +311,30 @@ declare -A EMITTED_IMAGE=()
 #
 # WiFi: a freshly flashed OpenWrt leaves every radio disabled until someone logs
 # in and picks a country, which reads as "WiFi does not work" on a 5G CPE.  The
-# defaults below turn both radios on with one shared SSID.  CHANGE THE KEY
-# before flashing anything you care about.
-H5000M_WIFI_SSID="${H5000M_WIFI_SSID:-openwrt}"
-# No password by default.  Encryption is `none` and there is no key, so the
-# first boot brings up an open network: a fresh device is reachable without
-# anyone having to know a credential that is printed nowhere.  Owners are
-# expected to set their own; the first-boot script never overwrites an SSID that
-# has already been changed.
-H5000M_WIFI_KEY="${H5000M_WIFI_KEY:-}"
+# defaults below turn both radios on with a documented name, key and country.
+#
+# The two radios get DIFFERENT names by default.  A shared SSID hides which band
+# a client is on, and "WiFi is slow" is nearly always a client parked on 2.4 GHz
+# (40 MHz of a congested band) while the 5 GHz radio sits idle.  Distinct names
+# make that visible in one glance at the client, and let IoT gear be pinned to
+# 2.4 GHz on purpose.  H5000M_WIFI_SSID is the base the two per-band names are
+# derived from; set the per-band variables to override either one directly, or
+# set all three to the same string to get a single shared name back.
+H5000M_WIFI_SSID="${H5000M_WIFI_SSID:-Higoros-H5000M}"
+H5000M_WIFI_SSID_2G="${H5000M_WIFI_SSID_2G:-${H5000M_WIFI_SSID}-2.4G}"
+H5000M_WIFI_SSID_5G="${H5000M_WIFI_SSID_5G:-${H5000M_WIFI_SSID}-5G}"
+# The network is encrypted.  The earlier default was an open network
+# (encryption=none, no key) justified by "a fresh device is reachable without
+# anyone knowing a credential" — true, but it also meant every unit shipped a
+# wide-open AP, and the key that was "printed nowhere" was also in no backup.
+# sae-mixed is the WPA2/WPA3 transitional mode: WPA3-SAE for clients that speak
+# it, WPA2-PSK for everything older, so no client is locked out.  The hostapd in
+# this image is wpad-basic-mbedtls, which carries SAE; the first-boot script
+# pairs the key with ieee80211w=1 (PMF optional), which sae-mixed requires.
+# The first-boot script never overwrites an SSID the owner has already changed.
+H5000M_WIFI_KEY="${H5000M_WIFI_KEY:-H987654321}"
 H5000M_WIFI_COUNTRY="${H5000M_WIFI_COUNTRY:-CN}"
-H5000M_WIFI_ENCRYPTION="${H5000M_WIFI_ENCRYPTION:-none}"
+H5000M_WIFI_ENCRYPTION="${H5000M_WIFI_ENCRYPTION:-sae-mixed}"
 H5000M_WIFI_HTMODE_2G="${H5000M_WIFI_HTMODE_2G:-EHT40}"
 H5000M_WIFI_HTMODE_5G="${H5000M_WIFI_HTMODE_5G:-EHT160}"
 
@@ -688,12 +701,14 @@ show_features() {
 	log "Target        : ${TARGET_BOARD}/${TARGET_SUBTARGET} profile=${TARGET_PROFILE}"
 	log "Board stack   : fancontrol=${ENABLE_FANCONTROL} netmode=${ENABLE_NETMODE} wwand=${ENABLE_WWAND} mt5700m=${ENABLE_MT5700M} qmodem=${ENABLE_QMODEM} oaf=${ENABLE_OAF} higoros=${ENABLE_HIGOROS}"
 	log "UI            : argon=${ENABLE_THEME_ARGON} istore=${ENABLE_ISTORE} tailscale=${ENABLE_TAILSCALE}"
-	# Say plainly whether the default network is open — "encryption=none" is
-	# easy to miss in a build log and this is a security-relevant default.
+	# Say plainly which names and whether the network is open — "encryption=none"
+	# is easy to miss in a build log and this is a security-relevant default.
+	# Both SSIDs are printed: with distinct per-band names a wrong suffix in one
+	# of them is otherwise invisible until someone tries to join that band.
 	if [ "${H5000M_WIFI_ENCRYPTION}" = 'none' ]; then
-		log "First boot    : wifi=${H5000M_WIFI_SSID}/${H5000M_WIFI_COUNTRY} OPEN NETWORK (no password) offload=sw:${H5000M_FLOW_OFFLOAD}/hw:${H5000M_FLOW_OFFLOAD_HW}"
+		log "First boot    : wifi2g=${H5000M_WIFI_SSID_2G} wifi5g=${H5000M_WIFI_SSID_5G} country=${H5000M_WIFI_COUNTRY} OPEN NETWORK (no password) offload=sw:${H5000M_FLOW_OFFLOAD}/hw:${H5000M_FLOW_OFFLOAD_HW}"
 	else
-		log "First boot    : wifi=${H5000M_WIFI_SSID}/${H5000M_WIFI_COUNTRY} ${H5000M_WIFI_ENCRYPTION} offload=sw:${H5000M_FLOW_OFFLOAD}/hw:${H5000M_FLOW_OFFLOAD_HW}"
+		log "First boot    : wifi2g=${H5000M_WIFI_SSID_2G} wifi5g=${H5000M_WIFI_SSID_5G} country=${H5000M_WIFI_COUNTRY} ${H5000M_WIFI_ENCRYPTION} offload=sw:${H5000M_FLOW_OFFLOAD}/hw:${H5000M_FLOW_OFFLOAD_HW}"
 	fi
 	log "apk source    : ${H5000M_APK_REPO_URL:-(none)}"
 	log "Optional      : upnp=${ENABLE_UPNP} adblock=${ENABLE_ADBLOCK} dockerman=${ENABLE_DOCKERMAN}"
@@ -2110,7 +2125,8 @@ write_h5000m_runtime_config() {
 	# first-boot script and leave the radios unconfigured on every boot, with
 	# nothing in the logs but a one-line parse error.  Refuse to build instead.
 	local var val
-	for var in H5000M_WIFI_SSID H5000M_WIFI_KEY H5000M_WIFI_COUNTRY \
+	for var in H5000M_WIFI_SSID H5000M_WIFI_SSID_2G H5000M_WIFI_SSID_5G \
+		H5000M_WIFI_KEY H5000M_WIFI_COUNTRY \
 		H5000M_WIFI_ENCRYPTION H5000M_WIFI_HTMODE_2G H5000M_WIFI_HTMODE_5G \
 		H5000M_FLOW_OFFLOAD H5000M_FLOW_OFFLOAD_HW; do
 		val="${!var}"
@@ -2125,6 +2141,8 @@ write_h5000m_runtime_config() {
 	cat >"$conf" <<EOF
 # Generated by scripts/local-build.sh — do not edit; edit the build instead.
 H5000M_WIFI_SSID='${H5000M_WIFI_SSID}'
+H5000M_WIFI_SSID_2G='${H5000M_WIFI_SSID_2G}'
+H5000M_WIFI_SSID_5G='${H5000M_WIFI_SSID_5G}'
 H5000M_WIFI_KEY='${H5000M_WIFI_KEY}'
 H5000M_WIFI_COUNTRY='${H5000M_WIFI_COUNTRY}'
 H5000M_WIFI_ENCRYPTION='${H5000M_WIFI_ENCRYPTION}'

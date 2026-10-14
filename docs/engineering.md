@@ -574,24 +574,30 @@ OpenWrt 出厂把所有 radio 设为 `disabled`，要登录并选国家才启用
 uci-defaults 有可能在任何 radio 段存在之前就运行、什么都没配上。把 hotplug 脚本编到
 `20`（在 `10-wifi-detect` 之后）才能保证顺序。
 
-应用一次后用 `/etc/h5000m-defaults-applied` 标记，并由
-`lib/upgrade/keep.d/h5000m-defaults` 让 sysupgrade 保留该标记，所以后续刷机
-**不会重置用户改过的设置**。判断条件也很保守：只要任一 AP 的 SSID 已不是默认值，
+应用一次后用 `/etc/h5000m-wifi-applied` 与 `/etc/h5000m-offload-applied` 两个**独立**标记
+（无线与卸载开关可用的时机不同，共用一个标记会让先到的那个烧掉标记、另一个永远不再执行），
+并由 `lib/upgrade/keep.d/h5000m-defaults` 让 sysupgrade 保留这两个标记，所以后续刷机
+**不会重置用户改过的设置**。判断条件也很保守：只要任一 AP 的 SSID 既不是出厂名
+（`openwrt` / `OpenWrt` / 空）也不是本镜像可能写过的名字（基名 + 两个分频名），
 就完全不碰。
 
 默认值（构建时可覆盖，见下表）：
 
 ```
-SSID       openwrt
-密码       无                ← 默认开放网络，请自行加密
-国家/加密  CN / none
+SSID       2.4G = Higoros-H5000M-2.4G      5G = Higoros-H5000M-5G
+           （基名 Higoros-H5000M；两频分开命名，省得"网速慢"时看不出挂在哪一频）
+密码       H987654321
+国家/加密  CN / sae-mixed（= WPA2/WPA3 混合，老设备回落 WPA2，不会连不上）
 htmode     2.4G=EHT40  5G=EHT160
 ```
 
-**默认是开放网络**：`encryption=none` 且不写 `key`。这样一台刚刷好的设备无需任何凭据即可
-连上，凭据不会被印在某个没人看的地方。首启脚本在无密码时**删除** `key` 选项而不是写入
-空值，并且**不设置** `ieee80211w` —— 在未加密接口上要求 PMF 会让 hostapd 拒绝整份 AP
-配置。构建日志会明确写出 `OPEN NETWORK`。
+**默认是加密的**（`sae-mixed` + 密码），因为开放 AP 的代价是所有出厂设备都开着；
+`encryption=none` + 空 `key` 仍是受支持的构建组合（两个变量都是构建输入），
+该路径下首启脚本会**删除** `key` 选项而不是写空值，并且**不设置** `ieee80211w` —— 在
+未加密接口上要求 PMF 会让 hostapd 拒绝整份 AP 配置。反过来，`sae-mixed` **必须**配
+`ieee80211w=1`（PMF 至少可选），两者是成套的。已实测：hostapd 生效配置为
+`wpa_key_mgmt=SAE WPA-PSK WPA-PSK-SHA256`，`iwinfo` 报
+`Encryption: SAE / WPA-PSK / WPA-PSK-SHA256 (CCMP)`。
 
 另外**不写** `bss_transition` —— 官方紧凑版 wpad 不认识该 hostapd 选项，会导致
 **整个 AP 配置被拒绝**。
@@ -655,7 +661,9 @@ CI 会自动按运行它的仓库推导地址，并有独立 job 把仓库发布
 | 构建变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `H5000M_APK_REPO_URL` | 空 | 仓库基址；**留空则固件不带额外源**（指向不存在的托管会让 `apk update` 报错） |
-| `H5000M_WIFI_SSID` / `_KEY` / `_COUNTRY` / `_ENCRYPTION` | `openwrt` / 空 / `CN` / `none` | 首启无线默认值；默认无密码 |
+| `H5000M_WIFI_SSID` / `_SSID_2G` / `_SSID_5G` | `Higoros-H5000M` / `<基名>-2.4G` / `<基名>-5G` | 首启无线名称：基名 + 两个可分别覆盖的频段名 |
+| `H5000M_WIFI_KEY` / `_ENCRYPTION` | `H987654321` / `sae-mixed` | 首启无线凭据；`none` + 空 key 即开放网络 |
+| `H5000M_WIFI_COUNTRY` | `CN` | 首启国家码 |
 | `H5000M_FLOW_OFFLOAD` / `_HW` | `1` / `1` | 软件 / PPE 硬件卸载 |
 
 ### 8. 调制解调器重复 —— 已修复（只剩一个 wwand）

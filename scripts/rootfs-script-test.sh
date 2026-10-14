@@ -119,7 +119,11 @@ cp "$WORK/root/etc/h5000m-defaults.conf" "$WORK/h5000m-defaults.conf"
 # shellcheck source=/dev/null
 . "$WORK/h5000m-defaults.conf"
 
-seed_wireless() { # seed_wireless <ssid>
+seed_wireless() { # seed_wireless <ssid2g> [ssid5g]
+	# Two names can be seeded independently because the default is one name per
+	# band; a single argument still seeds both, which is how a factory-fresh or
+	# an owner-configured (shared name) wireless config looks.
+	local s2g="$1" s5g="${2:-$1}"
 	cat >"$WORK/config/wireless" <<EOF
 config wifi-device 'radio0'
 	option type 'mac80211'
@@ -134,12 +138,12 @@ config wifi-device 'radio1'
 config wifi-iface 'default_radio0'
 	option device 'radio0'
 	option mode 'ap'
-	option ssid '$1'
+	option ssid '$s2g'
 
 config wifi-iface 'default_radio1'
 	option device 'radio1'
 	option mode 'ap'
-	option ssid '$1'
+	option ssid '$s5g'
 EOF
 	printf "config defaults\n\toption input 'REJECT'\n" >"$WORK/config/firewall"
 	rm -f "$WORK/marker-wifi" "$WORK/marker-offload"
@@ -154,9 +158,18 @@ check "radio0.country" "$H5000M_WIFI_COUNTRY" "$(uci -q get wireless.radio0.coun
 check "radio0.disabled" "0" "$(uci -q get wireless.radio0.disabled)"
 check "radio0.htmode" "$H5000M_WIFI_HTMODE_2G" "$(uci -q get wireless.radio0.htmode)"
 check "radio1.htmode" "$H5000M_WIFI_HTMODE_5G" "$(uci -q get wireless.radio1.htmode)"
-check "default_radio0.ssid" "$H5000M_WIFI_SSID" "$(uci -q get wireless.default_radio0.ssid)"
+# Each band carries its own name, and BOTH are asserted: with distinct per-band
+# names a copy/paste error in one of them leaves the other band looking fine.
+check "default_radio0.ssid (2.4 GHz name)" "$H5000M_WIFI_SSID_2G" "$(uci -q get wireless.default_radio0.ssid)"
+check "default_radio1.ssid (5 GHz name)" "$H5000M_WIFI_SSID_5G" "$(uci -q get wireless.default_radio1.ssid)"
 check "default_radio0.key" "$H5000M_WIFI_KEY" "$(uci -q get wireless.default_radio0.key)"
 check "default_radio0.enc" "$H5000M_WIFI_ENCRYPTION" "$(uci -q get wireless.default_radio0.encryption)"
+check "default_radio1.key" "$H5000M_WIFI_KEY" "$(uci -q get wireless.default_radio1.key)"
+check "default_radio1.enc" "$H5000M_WIFI_ENCRYPTION" "$(uci -q get wireless.default_radio1.encryption)"
+# sae-mixed is refused by hostapd unless PMF is at least optional, so the two
+# settings ship together or the AP does not come up at all.
+check "default_radio0.ieee80211w (PMF optional, required by sae-mixed)" "1" "$(uci -q get wireless.default_radio0.ieee80211w)"
+check "default_radio1.ieee80211w" "1" "$(uci -q get wireless.default_radio1.ieee80211w)"
 check "flow_offloading" "$H5000M_FLOW_OFFLOAD" "$(uci -q get firewall.@defaults[0].flow_offloading)"
 check "flow_offloading_hw" "$H5000M_FLOW_OFFLOAD_HW" "$(uci -q get firewall.@defaults[0].flow_offloading_hw)"
 
@@ -169,12 +182,82 @@ else
 fi
 
 echo
+echo "== profile: the SSID already carries THIS image's name — the pass stays idempotent"
+# A lost marker must not freeze the WiFi defaults at the previous build just
+# because the guard read our own SSID as "the owner's choice".  Re-applying has
+# to be a no-op in effect: same names, same key, same country.
+seed_wireless "$H5000M_WIFI_SSID_2G" "$H5000M_WIFI_SSID_5G"
+sh "$WORK/firstboot"
+check "still our 2.4 GHz name" "$H5000M_WIFI_SSID_2G" "$(uci -q get wireless.default_radio0.ssid)"
+check "still our 5 GHz name" "$H5000M_WIFI_SSID_5G" "$(uci -q get wireless.default_radio1.ssid)"
+check "key reapplied" "$H5000M_WIFI_KEY" "$(uci -q get wireless.default_radio0.key)"
+check "country reapplied" "$H5000M_WIFI_COUNTRY" "$(uci -q get wireless.radio0.country)"
+check "marker written (the pass really did apply)" "yes" "$([ -e "$WORK/marker-wifi" ] && echo yes || echo no)"
+
+echo
+echo "== profile: the SSID is the BASE name (a half-applied state) — must be split"
+# The base name is what an interrupted run, or a device configured before the
+# per-band split existed, looks like.  It has to count as default as well: a
+# guard that reads it as the owner's choice freezes the device on the base name
+# and the per-band names never arrive.  Measured on a real device: the run
+# returned 1, wrote no marker, logged nothing, and both radios stayed on
+# "Higoros-H5000M".
+seed_wireless "$H5000M_WIFI_SSID"
+sh "$WORK/firstboot"
+check "base name split to the 2.4 GHz name" "$H5000M_WIFI_SSID_2G" "$(uci -q get wireless.default_radio0.ssid)"
+check "base name split to the 5 GHz name" "$H5000M_WIFI_SSID_5G" "$(uci -q get wireless.default_radio1.ssid)"
+check "key applied on the split" "$H5000M_WIFI_KEY" "$(uci -q get wireless.default_radio0.key)"
+
+echo
 echo "== profile: owner already changed the SSID — nothing may be touched"
 seed_wireless MyOwnWiFi
 sh "$WORK/firstboot"
-check "ssid preserved" "MyOwnWiFi" "$(uci -q get wireless.default_radio0.ssid)"
+check "ssid preserved (2.4 GHz)" "MyOwnWiFi" "$(uci -q get wireless.default_radio0.ssid)"
+check "ssid preserved (5 GHz)" "MyOwnWiFi" "$(uci -q get wireless.default_radio1.ssid)"
 check "radio0.disabled kept" "1" "$(uci -q get wireless.radio0.disabled)"
+check "no key written onto the owner's network" "" "$(uci -q get wireless.default_radio0.key)"
+check "no htmode written onto the owner's radios" "" "$(uci -q get wireless.radio0.htmode)"
 check "offload still applied" "$H5000M_FLOW_OFFLOAD" "$(uci -q get firewall.@defaults[0].flow_offloading)"
+
+echo
+echo "== profile: ONE band carries our name, the other is the owner's — all or nothing"
+# The guard is per-device, not per-radio: one owner-changed band stops the whole
+# pass.  Mixed state is exactly what a half-applied config leaves behind, and
+# overwriting the owner's band to "fix" it is worse than doing nothing.
+seed_wireless "$H5000M_WIFI_SSID_2G" 'MyOwnWiFi'
+sh "$WORK/firstboot"
+check "the owner's band untouched" "MyOwnWiFi" "$(uci -q get wireless.default_radio1.ssid)"
+check "our band not re-keyed either" "" "$(uci -q get wireless.default_radio0.key)"
+check "radio0.disabled kept" "1" "$(uci -q get wireless.radio0.disabled)"
+
+echo
+echo "== profile: an open network via a build override (ENCRYPTION=none) — no stray key"
+# The shipped default is now encrypted, but the key and the encryption mode stay
+# build inputs, so the open-network path has to keep working.  An empty key or
+# encryption=none must DELETE key and ieee80211w: leaving an empty option behind,
+# or asking for PMF on an unencrypted interface, makes hostapd reject the whole
+# AP configuration instead of ignoring the extra options.
+cp "$WORK/h5000m-defaults.conf" "$WORK/h5000m-defaults.conf.saved"
+cat >"$WORK/h5000m-defaults.conf" <<'OPENEOF'
+H5000M_WIFI_SSID='OpenNetworkH5000M'
+H5000M_WIFI_SSID_2G='OpenNetworkH5000M-2.4G'
+H5000M_WIFI_SSID_5G='OpenNetworkH5000M-5G'
+H5000M_WIFI_KEY=''
+H5000M_WIFI_COUNTRY='CN'
+H5000M_WIFI_ENCRYPTION='none'
+H5000M_WIFI_HTMODE_2G='EHT40'
+H5000M_WIFI_HTMODE_5G='EHT160'
+H5000M_FLOW_OFFLOAD='1'
+H5000M_FLOW_OFFLOAD_HW='1'
+OPENEOF
+seed_wireless OpenWrt
+sh "$WORK/firstboot"
+check "open: encryption" "none" "$(uci -q get wireless.default_radio0.encryption)"
+check "open: 2.4 GHz name from the override" "OpenNetworkH5000M-2.4G" "$(uci -q get wireless.default_radio0.ssid)"
+check "open: 5 GHz name from the override" "OpenNetworkH5000M-5G" "$(uci -q get wireless.default_radio1.ssid)"
+check "open: no empty key left behind" "" "$(uci -q get wireless.default_radio0.key)"
+check "open: no PMF left behind" "" "$(uci -q get wireless.default_radio0.ieee80211w)"
+mv "$WORK/h5000m-defaults.conf.saved" "$WORK/h5000m-defaults.conf"
 
 echo
 echo "== profile: /etc/config/wireless exists but is EMPTY (as the image ships it)"

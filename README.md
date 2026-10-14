@@ -116,10 +116,12 @@ H5000M 的 U-Boot 自带 failsafe，上传 initramfs 镜像后系统在内存里
 | 面板分工 | `:80` = HigoOS 面板 · `:8080` / `:8443` = 传统 LuCI |
 | 主机名 | `Hiveton H5000M` |
 | DHCP 池 | `.100 ~ .249`，租期 12h |
-| Wi-Fi | SSID `openwrt`，**无密码（开放网络）** |
+| Wi-Fi | 2.4G `Higoros-H5000M-2.4G` · 5G `Higoros-H5000M-5G` |
+| Wi-Fi 加密 | **WPA2/WPA3 混合（`sae-mixed`）**，密码 `H987654321` |
 | 国家码 | `CN` |
 
-> **默认是开放网络，连上后请立刻设密码**（HigoOS 面板或 LuCI 里都可以改）。
+> **两个频段分开命名**：一眼就能看出客户端挂在哪个频段（"网速慢"通常是设备停在 2.4G）。
+> 密码也是构建默认值（`H5000M_WIFI_KEY`）——**拿到设备请先改掉**。
 > 首启脚本只写一次，之后不会覆盖你改过的设置。
 
 ---
@@ -251,8 +253,9 @@ gh workflow run build.yml --ref higoros-qmodem
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `H5000M_WIFI_SSID` | `openwrt` | 首启 SSID |
-| `H5000M_WIFI_KEY` / `_ENCRYPTION` | 空 / `none` | 默认开放网络 |
+| `H5000M_WIFI_SSID` | `Higoros-H5000M` | 首启 SSID **基名**；两个频段名由它派生 |
+| `H5000M_WIFI_SSID_2G` / `_5G` | `<基名>-2.4G` / `<基名>-5G` | 两个频段各自的 SSID；设成同一个值即回到"单名" |
+| `H5000M_WIFI_KEY` / `_ENCRYPTION` | `H987654321` / `sae-mixed` | WPA2/WPA3 混合；`_ENCRYPTION=none` + 空 `_KEY` 即回到开放网络 |
 | `H5000M_APK_REPO_URL` | 空 | 软件源基址；留空则固件不带额外源 |
 | `ENABLE_QMODEM` / `ENABLE_OAF` / `ENABLE_HIGOROS` | 在线构建固定开 | 5G 栈 / 应用过滤 / 海狗保真层 |
 | `ENABLE_PASSWALL` / `ENABLE_PASSWALL2` | `true` | 编进软件源（`=m`），不占镜像体积 |
