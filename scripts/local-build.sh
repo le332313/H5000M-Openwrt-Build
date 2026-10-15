@@ -4159,10 +4159,14 @@ configure_build() {
 	config_set_symbol "CONFIG_LUCI_LANG_zh_Hans" "y"
 
 	# Re-asserted for the same reason as the language: defconfig regenerates the
-	# feed symbols, and losing this one puts a URL that does not exist back into
-	# the image's apk sources, where it makes every `apk update` on the device
-	# fail.  See the note in configs/h5000m.config.
+	# feed symbols, and losing one puts a URL that does not exist back into the
+	# image's apk sources, where every `apk update` on the device reports it as
+	# unavailable.  One entry per third-party feed in feeds.conf.default — the
+	# official feeds are published by buildbot and must stay live.  See the note
+	# in configs/h5000m.config.
 	config_set_symbol "CONFIG_FEED_wwand" "m"
+	config_set_symbol "CONFIG_FEED_oaf" "m"
+	config_set_symbol "CONFIG_FEED_qmodem" "m"
 
 	build_required_packages
 	local pkg

@@ -658,6 +658,21 @@ bin/targets/<board>/<subtarget>/packages/   全部 kmod   ← 别的仓库给不
 `/etc/apk/repositories.d/50-h5000m.list`（OpenWrt 为此保留的文件，且 sysupgrade 会保留）。
 CI 会自动按运行它的仓库推导地址，并有独立 job 把仓库发布到 Pages。
 
+**(c) 第三方 feed 会在 `distfeeds.list` 里留下死链 —— 已修复。**
+OpenWrt 为**每一个**已配置的 feed 都往 `/etc/apk/repositories.d/distfeeds.list` 写一行
+（`include/feeds.mk` 的 `FeedSourcesAppendAPK`，由 `package/base-files/install` 调用），
+而这些 URL 只对 buildbot 真正发布的 feed 存在。本镜像从第三方仓库拉三个 feed
+（`oaf` / `qmodem` / `wwand`），2026-10-14 的镜像里 `.../oaf/packages.adb` 与
+`.../qmodem/packages.adb` 实测 404，设备上每次 `apk update` 报 2 条 WARNING +
+`2 unavailable`（`is-opkg update` 仍返回 0、10627 包可用，**功能无损，是噪音不是故障**）。
+
+修法是在 `.config` 里把 `CONFIG_FEED_oaf` / `CONFIG_FEED_qmodem` / `CONFIG_FEED_wwand`
+置 `m`：`feeds.mk` 仍写这两行，但会加 `#` 前缀，死链不再是活行。`CONFIG_FEED_*` 在整个
+构建系统里只被 `feeds.mk` 和 `base-files` 的 `PKG_CONFIG_DEPENDS` 引用，**不参与任何包的
+选择、安装或构建**，所以它只能压掉那条 URL，不会改变镜像内容。见
+`configs/h5000m.config` 的 feeds 段；闸门 A 的 **A11** 用「活行」判据守着它
+（负对照在 2026-10-14 的镜像上实测报红）。
+
 | 构建变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `H5000M_APK_REPO_URL` | 空 | 仓库基址；**留空则固件不带额外源**（指向不存在的托管会让 `apk update` 报错） |
@@ -1076,7 +1091,8 @@ rootfs 里（`tun.ko`/`dummy.ko`/`inet_diag.ko`）、`sing-box` 二进制在、�
 包进仓库还不够，**还要有人真的依赖它**。这一条是用真机 + apk 自己复现出来的。
 
 把发布出去的 `packages.adb` 当成一个真实仓库，配上一台设备会有的全部源（本仓库 +
-`distfeeds.list` 里那 7 条官方 snapshot 源），用本机编译出的 `staging_dir/host/bin/apk`
+`distfeeds.list` 里指向 `downloads.openwrt.org` 的 7 条源；当时另有 `oaf` / `qmodem`
+两条第三方源是 404，见第 7 节 (c)），用本机编译出的 `staging_dir/host/bin/apk`
 去问：
 
 ```
