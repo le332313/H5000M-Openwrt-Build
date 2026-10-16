@@ -12,7 +12,26 @@ on:
   # master-protection ruleset to have anything to report: a branch
   # ruleset can only require a check that PRs actually run.
   pull_request:
+  # push used to be tags-only, and that left a five-day hole this repository
+  # fell into on 2026-10-16.
+  #
+  # What happened: upstream deleted package/network/utils/nftables/patches/
+  # (nftables 1.1.7 merged its build patches).  The step further down named
+  # "Verify the fullcone patches still apply to the sources upstream ships"
+  # exists to catch exactly that, and it would have failed — but it did not run,
+  # because the commit went to a branch and the last run had been the Monday
+  # cron, when the tree still carried the directory.  The break stayed invisible
+  # until a full firmware build spent an hour compiling and then failed on the
+  # firewall4 assertions alone (run 38875973016).  A 46-second job was sitting
+  # right there, unfired.
+  #
+  # So branch pushes now run it too.  The tag patterns are unchanged and are
+  # what release-please uses; this is a pure addition, with no path filter, so
+  # the tag semantics cannot be affected by it.
   push:
+    branches:
+      - master
+      - higoros-qmodem
     tags:
       - 'openwrt-*'
       - 'v*'
