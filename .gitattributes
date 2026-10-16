@@ -4,6 +4,7 @@
 *.patch text eol=lf
 *.config text eol=lf
 *.env text eol=lf
+*.conf text eol=lf
 *.yml text eol=lf
 
 # higoros-overlay: every file here is shipped into the firmware byte-for-byte,

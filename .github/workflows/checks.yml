@@ -987,6 +987,63 @@ jobs:
           log_files: 'pinned-libnftnl.log pinned-nftables.log main-libnftnl.log main-nftables.log'
           tail_lines: '80'
 
+  # ---------------------------------------------------------------------------
+  # 上游补丁系列回放
+  #
+  # 为什么要有这个作业：2026-10-16 上游 main 把同一个修复打了两遍 —— libjson-c
+  # 的 002（10-15 引入）和 010（10-16 引入）改的是 json_object.c 同一行 435，
+  # 002 没被撤掉。两补丁同时在的树谁也编不出来：002 先应用，010 的上下文就没了，
+  # 它自己报 "Hunk #1 FAILED at 435"。这个树是 unpinned 派发 run 38897769334
+  # 抓到的，距上游那次提交只过去七分钟，而它花掉三十分钟编译才暴露出来。
+  # 钉版不受影响（它两个补丁都没有）—— 但 unpinned 既跟 main，又是唯一能推进
+  # 钉版的路径。
+  #
+  # scripts/local-build.sh 里 drop_superseded_upstream_patches 会把多余的那个
+  # 停用（见 configs/upstream-patch-drops.conf）。本作业就是证明那条规则是对的：
+  # 拿真实的上游 tarball，把「停用之后剩下的补丁」在钉版和 main 两棵树上各打一遍，
+  # 二十秒出结果。它同时兜住另外三种情形：规则失效（guard 没了）、规则写错、
+  # 以及上游下周又landed一对同改一行的补丁。
+  #
+  # 判据落在 patch 的退出码和它报的 hunk 上，不是文件比对：「这两个补丁都删了
+  # 435 行」只是文本层面的猜测，对任何一个碰了空行或花括号的补丁对都会误报。
+  # ---------------------------------------------------------------------------
+  patch-series:
+    name: 上游补丁系列回放
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates curl xz-utils patch
+
+      - name: 回放（钉版 + 上游 main）
+        run: |
+          set -euo pipefail
+          . configs/upstream.env
+
+          SRC=/tmp/upstream-check
+          rm -rf "$SRC" /tmp/pinned-tree
+          git clone -q --depth 1 --branch "${OPENWRT_REPO_BRANCH}" \
+            "${OPENWRT_REPO_URL}" "$SRC"
+
+          PIN="${OPENWRT_PINNED_REVISION:-}"
+          if [ -n "$PIN" ]; then
+            git -C "$SRC" fetch -q --depth 1 origin "$PIN"
+            mkdir -p /tmp/pinned-tree
+            git -C "$SRC" archive FETCH_HEAD | tar -x -C /tmp/pinned-tree
+            bash scripts/verify-patch-series.sh /tmp/pinned-tree pinned
+          else
+            echo "configs/upstream.env 里没有 OPENWRT_PINNED_REVISION，跳过钉版那一套"
+          fi
+
+          bash scripts/verify-patch-series.sh "$SRC" main
+
   commitlint:
     name: 提交信息规约
     runs-on: ubuntu-24.04

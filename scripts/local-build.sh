@@ -3084,6 +3084,111 @@ install_nftables_patches() {
 	return 0
 }
 
+# Trim a config field, and strip a trailing CR, without starting a process.
+#
+# `x=$(printf '%s' "$x" | tr -d '\r' | sed ...)` is three process spawns for a
+# trim.  That is free on a CI runner and costs about a second per field inside
+# the sandbox this is developed in, where spawning a process is roughly 250 ms
+# — enough that a sixty-line config took minutes to parse and looked like a
+# hang.  `printf -v` is a builtin, so this stays one.
+trim_into() { # <variable name> <value>
+	local v="$2"
+	v=${v%$'\r'}
+	v="${v#"${v%%[![:space:]]*}"}"
+	v="${v%"${v##*[![:space:]]}"}"
+	printf -v "$1" '%s' "$v"
+}
+
+# Stop applying upstream patches that upstream has itself superseded.
+#
+# WHY A "DROP" AND NOT A PATCH OF OURS
+#
+#   On 2026-10-16 main carried two patches for the same seven lines of
+#   libjson-c's json_object.c — 002 landed 2026-10-15, 010 landed 2026-10-16
+#   and 002 was never removed.  002 applies, 010's hunk then has no context
+#   left, and the package fails at `prepare` with "Hunk #1 FAILED at 435".
+#   Nothing about that tree is wrong on our side; it is simply not buildable
+#   by anyone, and the unpinned path — the only one that may advance the pin —
+#   is exactly the path that has to build it.
+#
+#   There is no way to make `patch` tolerate this: 010 does not apply, it is
+#   not a fuzz or offset problem.  The only two options are "wait for upstream"
+#   (the unpinned build is red for as long as that takes, and the pin cannot
+#   move) or "do not apply the redundant one".  This function does the second.
+#   Nothing is rewritten: the patch that survives is unmodified upstream text,
+#   and both of these fix the identical NDEBUG leak.
+#
+# WHY THE GUARD FIELD IS THE WHOLE POINT
+#
+#   A permanent "delete this file from the upstream tree" list rots: upstream
+#   removes the duplicate, and the rule goes on deleting a patch that is now
+#   the only fix.  So every rule names a GUARD patch that must also be present
+#   for the drop to fire.  Rules are then self-limiting — when upstream fixes
+#   the duplication, the rule stops firing on its own — and a rule whose guard
+#   has gone missing is reported as a warning rather than quietly doing
+#   nothing.  See configs/upstream-patch-drops.conf.
+#
+#   The build does not silently depend on this: .github/workflows/checks.yml
+#   replays the surviving series against the real upstream tarball on both the
+#   pinned revision and main, so a rule that stopped being right, or a second
+#   duplicate landing next week, is a twenty-second check instead of a
+#   thirty-minute build failure.
+drop_superseded_upstream_patches() {
+	local conf="${ROOT_DIR}/configs/upstream-patch-drops.conf"
+	local pkg victim guard why dir dropped=0 skipped=0
+
+	[ -f "$conf" ] || {
+		log "No upstream patch drops configured."
+		return 0
+	}
+
+	# Fields are `|` separated; the last one is free text and may contain
+	# spaces.  CR is stripped because these files have been committed with
+	# CRLF before and a stray CR turns a filename into a filename that does
+	# not exist — the drop would then silently never fire.
+	while IFS='|' read -r pkg victim guard why || [ -n "$pkg" ]; do
+		trim_into pkg "$pkg"
+		trim_into victim "$victim"
+		trim_into guard "$guard"
+
+		case "$pkg" in
+			'' | '#'*) continue ;;
+		esac
+
+		dir="${SRC}/${pkg}/patches"
+		if [ ! -d "$dir" ]; then
+			warn "  drop rule for ${pkg}: no ${pkg}/patches/ directory in this tree — rule skipped"
+			skipped=$((skipped + 1))
+			continue
+		fi
+		if [ ! -f "${dir}/${victim}" ]; then
+			# The normal end of a rule's life: upstream removed the duplicate.
+			log "  drop rule for ${pkg}: ${victim} is gone — nothing to drop"
+			continue
+		fi
+		if [ ! -f "${dir}/${guard}" ]; then
+			# Never drop without the guard.  Doing so would throw away the
+			# only remaining copy of a fix.
+			warn "  drop rule for ${pkg}: guard ${guard} is missing — dropping nothing"
+			skipped=$((skipped + 1))
+			continue
+		fi
+
+		rm -f "${dir}/${victim}" \
+			|| die "cannot drop ${dir}/${victim}"
+		warn "  dropped superseded upstream patch ${pkg}/patches/${victim} (its guard ${guard} is present)"
+		dropped=$((dropped + 1))
+	done <"$conf"
+
+	if [ "$dropped" -gt 0 ]; then
+		warn "  ${dropped} upstream patch(es) not applied; see configs/upstream-patch-drops.conf"
+	fi
+	if [ "$skipped" -gt 0 ]; then
+		warn "  ${skipped} drop rule(s) could not be applied — the config and the tree disagree"
+	fi
+	return 0
+}
+
 # Proxy frontends, plus the cores the official feeds do not carry.  Everything is
 # emitted as `=m`: built into the apk repository, not installed into the image, so
 # a user picks with `apk add` and the frontend pulls its backend and helpers in.
@@ -5258,6 +5363,11 @@ main() {
 	seed_cached_build_state
 	prepare_feeds
 	apply_patches
+	# Before anything reads a package Makefile, and after the feeds exist: a
+	# rule may name a feed package.  Several of these packages are core, so
+	# this cannot be folded into apply_patches(), which runs at the top level
+	# and never sees a package's own patches/ directory.
+	drop_superseded_upstream_patches
 	# After the feeds exist and before anything reads the Makefile: the pin is a
 	# rewrite of feeds/packages/net/sing-box/Makefile (see pin_sing_box).
 	pin_sing_box
