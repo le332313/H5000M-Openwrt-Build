@@ -645,7 +645,24 @@ jobs:
           fail=0
           check() { if bash -c "$2" >/dev/null 2>&1; then echo "  OK    $1"; else echo "  FAIL  $1"; fail=$((fail+1)); fi; }
 
-          echo "=== layer 1: kernel module ==="
+          echo "=== layer 0: the fullcone patches reached the package tree ==="
+          # These are the files install_nftables_patches() copies in.  Asserting
+          # them here is what makes the 2026-10-16 failure impossible to repeat:
+          # upstream deleted package/network/utils/nftables/patches/ (nftables
+          # 1.1.7 merged its build patches), the installer opened with
+          # `[ -d $nftables/patches ] || return 0`, no patch was installed for
+          # ANY of the three packages, and the two userspace checks further down
+          # still passed — because the 17 GB build_dir cache held sources that
+          # an earlier run had already patched.  A patch file sitting in the
+          # package tree cannot be answered by that cache.
+          check "the nftables fullcone patch is in the package tree" \
+            'test -f openwrt/package/network/utils/nftables/patches/100-fullcone-expression.patch'
+          check "the libnftnl fullcone patch is in the package tree" \
+            'test -f openwrt/package/libs/libnftnl/patches/100-fullcone-expression.patch'
+          check "the firewall4 fullcone patch is in the package tree" \
+            'test -f openwrt/package/network/config/firewall4/patches/100-fullcone-support.patch'
+
+          echo; echo "=== layer 1: kernel module ==="
           check "nft_fullcone.ko was built" \
             'find openwrt/build_dir/target-*/linux-*/nft-fullcone -name nft_fullcone.ko | grep -q .'
           check "the module registers the fullcone expression" \
@@ -680,6 +697,14 @@ jobs:
           check "libnftables.so carries the fullcone expression name" \
             'grep -rqas fullcone openwrt/build_dir/target-*/nftables-*/*/src/.libs/libnftables.so.*'
 
+          # The same question asked of the packaged artefact rather than of the
+          # source tree.  A cached build_dir can satisfy every source-tree
+          # assertion above; it cannot answer for what .pkgdir holds, because
+          # that is produced by this run's own install step.
+          check "libnftables.so in the package dir carries the fullcone expression" \
+            'L=$(find openwrt/build_dir/target-*/libnftnl-*/.pkgdir -name "libnftnl.so.*" 2>/dev/null | head -1);
+             [ -n "$L" ] && strings "$L" | grep -q expr_ops_fullcone'
+
           echo; echo "=== layer 4: firewall4 ==="
           check "firewall4 accepts fullcone in its parse_defaults whitelist" \
             'grep -rqs --include=fw4.uc "fullcone: \[ \"bool\", \"0\" \]" openwrt/build_dir/target-*/firewall4-*/'
@@ -690,6 +715,12 @@ jobs:
           check "the acceleration page depends on all four layers" \
             'grep -q kmod-nft-fullcone openwrt/package/luci-app-h5000m-accel/Makefile &&
              grep -q firewall4 openwrt/package/luci-app-h5000m-accel/Makefile'
+
+          # Artefact-level, like the libnftnl one above: the .uc files as they
+          # will be packaged, not the copies in the source tree.
+          check "the packaged firewall4 templates emit fullcone" \
+            'F=$(find openwrt/build_dir/target-*/firewall4-*/.pkgdir -name zone-masq.uc 2>/dev/null | head -1);
+             [ -n "$F" ] && grep -q fullcone "$F"'
 
           echo; echo "=== config ==="
           check "firewall4 =y" 'grep -q "^CONFIG_PACKAGE_firewall4=y$" openwrt/.config'

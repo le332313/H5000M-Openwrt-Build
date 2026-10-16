@@ -179,13 +179,9 @@ diff -urN pristine/src/parser_bison.y work/src/parser_bison.y
 diff -urN pristine/src/scanner.l work/src/scanner.l
 --- a/src/scanner.l
 +++ b/src/scanner.l
-@@ -470,6 +470,7 @@
- "snat"			{ scanner_push_start_cond(yyscanner, SCANSTATE_STMT_NAT); return SNAT; }
- "dnat"			{ scanner_push_start_cond(yyscanner, SCANSTATE_STMT_NAT); return DNAT; }
- "masquerade"		{ scanner_push_start_cond(yyscanner, SCANSTATE_STMT_NAT); return MASQUERADE; }
-+"fullcone"		{ scanner_push_start_cond(yyscanner, SCANSTATE_STMT_NAT); return FULLCONE; }
- "redirect"		{ scanner_push_start_cond(yyscanner, SCANSTATE_STMT_NAT); return REDIRECT; }
+@@ -474,2 +474,3 @@
  "random"		{ return RANDOM; }
++<*>"fullcone"		{ scanner_push_start_cond(yyscanner, SCANSTATE_STMT_NAT); return FULLCONE; }
  <SCANSTATE_STMT_NAT>{
 diff -urN pristine/src/statement.c work/src/statement.c
 --- a/src/statement.c
