@@ -851,6 +851,112 @@ jobs:
         uses: ./.github/actions/diagnose
         with:
           title: 仓库与主机检查失败
+  # 2026-10-16："补丁能打上" ≠ "补丁能编过"。
+  #
+  # 当天上游把 libnftnl 的 expr_ops.set 回调多带了一个 byteorder 参数（1.3.1 → 1.3.2
+  # 与之配套，nftables 1.1.7 的 configure 就要求 libnftnl >= 1.3.2）。我们的补丁在
+  # `patch --dry-run` 下全部通过、真编译当场被 GCC 判死，而上面那条检查只做 dry-run，
+  # 于是这次事故白跑了一次 40 分钟的全量构建才暴露。
+  #
+  # 这个作业把上游 main 那一对源码真下下来、真打补丁、真编一遍：几十秒给出结论。
+  # 顺序不能反 —— 先把打了补丁的 libnftnl 编出来装进临时前缀，再用它编 nftables。
+  fullcone-build:
+    name: fullcone 补丁编译验证
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config curl xz-utils patch libmnl-dev
+
+      - name: 打补丁并真编 libnftnl 与 nftables
+        run: |
+          set -euo pipefail
+          . configs/upstream.env
+
+          SRC=/tmp/upstream-check
+          WORK=/tmp/fullcone-build
+          rm -rf "$SRC" "$WORK"; mkdir -p "$WORK"
+
+          git clone --depth 1 --branch "${OPENWRT_REPO_BRANCH}" \
+            "${OPENWRT_REPO_URL}" "$SRC"
+
+          # 版本与下载地址从 OpenWrt 的包 Makefile 里读，上游升级时这里自动跟着走，
+          # 不需要我们再维护一份版本表。
+          fetch_tarball() { # <树内包目录> → 打印 "<name> <version>"
+            local pkgdir="$1" name ver url file
+            name=$(sed -n 's/^PKG_NAME:=//p' "$SRC/$pkgdir/Makefile" | head -1)
+            ver=$(sed -n 's/^PKG_VERSION:=//p' "$SRC/$pkgdir/Makefile" | head -1)
+            url=$(sed -n 's/^PKG_SOURCE_URL:=//p' "$SRC/$pkgdir/Makefile" | head -1)
+            file=$(sed -n 's/^PKG_SOURCE:=//p' "$SRC/$pkgdir/Makefile" | head -1)
+            url=${url//'$(PKG_NAME)'/$name}; url=${url//'$(PKG_VERSION)'/$ver}
+            file=${file//'$(PKG_NAME)'/$name}; file=${file//'$(PKG_VERSION)'/$ver}
+            curl -fsSL --retry 3 --max-time 120 -o "$WORK/$file" "$url/$file" \
+              || { echo "::error::下载 $url/$file 失败"; exit 1; }
+            mkdir -p "$WORK/$name"
+            tar -xf "$WORK/$file" -C "$WORK/$name" --strip-components=1
+            printf '%s %s\n' "$name" "$ver"
+          }
+
+          echo "=== libnftnl：打补丁 → 编译 → 装进临时前缀 ==="
+          read -r ln_name ln_ver <<<"$(fetch_tarball package/libs/libnftnl)"
+          cd "$WORK/$ln_name"
+          patch -p1 --batch < "$GITHUB_WORKSPACE/libnftnl-patches/100-fullcone-expression.patch"
+          echo "    expr_ops.set 在 $ln_name $ln_ver 里的声明："
+          grep -oE '\(\*set\)\(struct nftnl_expr \*e[^)]*\)' include/expr_ops.h \
+            | head -1 | sed 's/^/      /'
+          ./configure --prefix="$WORK/prefix" > "$WORK/libnftnl.log" 2>&1 \
+            || { echo "::error::libnftnl $ln_ver configure 失败"; tail -30 "$WORK/libnftnl.log"; exit 1; }
+          make -j"$(nproc)" >> "$WORK/libnftnl.log" 2>&1 \
+            || { echo "::error::libnftnl $ln_ver 打了补丁后编译失败"; tail -60 "$WORK/libnftnl.log"; exit 1; }
+          # 挡住"补丁没进源码树、结果编了个干净树"这种假绿
+          grep -q 'expr/fullcone.lo' "$WORK/libnftnl.log" \
+            || { echo "::error::编译日志里没有 expr/fullcone.lo —— 补丁可能没落进源码树"; exit 1; }
+          make install >> "$WORK/libnftnl.log" 2>&1
+          echo "    OK：$ln_name $ln_ver 的 expr/fullcone.lo 已编译"
+
+          echo "=== nftables：用刚编好的 libnftnl 编 ==="
+          export PKG_CONFIG_PATH="$WORK/prefix/lib/pkgconfig"
+          read -r nf_name nf_ver <<<"$(fetch_tarball package/network/utils/nftables)"
+          cd "$WORK/$nf_name"
+          patch -p1 --batch < "$GITHUB_WORKSPACE/nftables-patches/100-fullcone-expression.patch"
+          # --without-cli：CLI 默认要 libedit，缺了就 configure 直接报错；库本身照编。
+          # --with-mini-gmp：省掉 libgmp 依赖，构建期不用装。
+          ./configure --prefix="$WORK/prefix" --without-cli --with-mini-gmp \
+            > "$WORK/nftables.log" 2>&1 \
+            || { echo "::error::nftables $nf_ver configure 失败（多半是上游改了依赖）"; tail -30 "$WORK/nftables.log"; exit 1; }
+          make -j"$(nproc)" >> "$WORK/nftables.log" 2>&1 \
+            || { echo "::error::nftables $nf_ver 打了补丁后编译失败"; tail -80 "$WORK/nftables.log"; exit 1; }
+          # flex 由 scanner.l 重新生成 scanner.c —— 判据必须落在生成物上
+          grep -q FULLCONE src/scanner.c \
+            || { echo "::error::生成的 scanner.c 里没有 FULLCONE —— lexer 那半补丁没生效"; exit 1; }
+          # 不用 `ls | head -1`：开了 pipefail，head 提前退出会把 find/ls 判成失败
+          lib=$(find . -name 'libnftables.so*' -print -quit 2>/dev/null || true)
+          if [ -z "$lib" ] || ! grep -qas fullcone "$lib"; then
+            echo "::error::libnftables.so 里没有 fullcone 表达式名"
+            exit 1
+          fi
+          echo "    OK：$nf_name $nf_ver 的 scanner.c 与 libnftables.so 都带上了 fullcone"
+          echo
+          echo "fullcone 补丁在上游 main 那一对源码上可编、可落位"
+
+      - name: 失败时把编译日志带到工作区
+        if: failure()
+        run: cp -f /tmp/fullcone-build/*.log . 2>/dev/null || true
+
+      - name: 失败诊断
+        if: failure()
+        uses: ./.github/actions/diagnose
+        with:
+          title: fullcone 补丁编译验证失败
+          log_files: 'libnftnl.log nftables.log'
+          tail_lines: '80'
+
   commitlint:
     name: 提交信息规约
     runs-on: ubuntu-24.04
