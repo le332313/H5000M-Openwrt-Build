@@ -34,6 +34,19 @@
 MARKER_WIFI='/etc/h5000m-wifi-applied'
 MARKER_OFFLOAD='/etc/h5000m-offload-applied'
 
+# The three settings below deliberately have NO marker.  Each one guards itself
+# on a property of the thing it is about to change, so re-running is a no-op and
+# a value the owner has since changed is never reset:
+#
+#   timezone  — only written while the config still reads as untouched
+#               (GMT0/UTC); once it says CST-8 the function returns immediately
+#   worker    — the file is only created when it does not exist
+#   guard     — the crontab line is only appended when it is not already there
+#
+# A marker would be strictly worse here: it is stored in /etc and preserved
+# across sysupgrade, so a unit whose owner deleted the file or cleared the
+# crontab by accident could never be repaired by a reflash.
+
 # The values below are written by scripts/local-build.sh into
 # /etc/h5000m-defaults.conf at build time, so the SSID, key, country and the
 # offload switches are build inputs rather than constants.  The fallbacks keep
@@ -44,10 +57,38 @@ H5000M_WIFI_SSID_5G='Higoros-H5000M-5G'
 H5000M_WIFI_KEY='H987654321'
 H5000M_WIFI_COUNTRY='CN'
 H5000M_WIFI_ENCRYPTION='sae-mixed'
-H5000M_WIFI_HTMODE_2G='EHT40'
-H5000M_WIFI_HTMODE_5G='EHT160'
+# Channel width.  Both defaults used to be the widest the chip can do, which is
+# the wrong trade on a real site:
+#
+#   2.4 GHz has three non-overlapping channels (1/6/11).  EHT40 there ALWAYS
+#   overlaps a neighbour, so in any built-up area it measures slower than 20 MHz
+#   while raising retries for everyone.  EHT20 is the honest setting.
+#
+#   5 GHz in CN is 36-64 plus 149-165, and 52-64 are DFS.  EHT160 starting at 36
+#   necessarily spans 36-64, so the AP must pass radar detection (CAC) before it
+#   comes up and must move channel if radar appears — visible to the owner as
+#   "5 GHz is missing for a while" and then "5 GHz dropped".  The 5.8 GHz block
+#   is not contiguous, so 160 MHz cannot be had there either.  EHT80 at 36 spans
+#   36-48, entirely non-DFS: up immediately, never kicked off.
+#
+# Note the EHT prefix is mandatory on this WiFi 7 target: wifi-scripts rejects a
+# bare "HT80" outright (valid set is NOHT/HT20/HT40*/VHT*/HE*/EHT*), and a
+# rejected htmode takes the whole radio down.  Measured on the device.
+H5000M_WIFI_HTMODE_2G='EHT20'
+H5000M_WIFI_HTMODE_5G='EHT80'
 H5000M_FLOW_OFFLOAD='1'
 H5000M_FLOW_OFFLOAD_HW='1'
+
+# qmodem-worker polling interval, in seconds.  This is the single knob that
+# decides how fast rpcd leaks memory on this board: rpcd never frees the output
+# buffer of an external-script ubus method, and qmodem is exactly that — so every
+# qmodem call costs heap.  Measured on the device: the worker is the source of
+# ~98% of all qmodem calls (freezing it drops qmodem invocations from 102 to 2
+# per 30 s), and at the stock 15 s it leaks 370-524 kB/min (≈ 750 MB/day), which
+# had accumulated to 619 MB and taken `available` down to 18 MB with load 21.
+# 60 s cuts that to a quarter.  The worker's own cache TTL is 90 s, so a 60 s
+# interval still refreshes before anything is considered stale.
+H5000M_QMODEM_WORKER_INTERVAL='60'
 # shellcheck source=/dev/null
 [ -f /etc/h5000m-defaults.conf ] && . /etc/h5000m-defaults.conf
 
@@ -184,6 +225,109 @@ configure_offload() {
 	return 0
 }
 
+# ----------------------------------------------------------------- timezone ---
+# A fresh OpenWrt comes up in UTC, so every timestamp the owner reads on this
+# box — logread, `ls -la`, the firmware page — sits 8 hours behind Beijing time.
+# Matching a log line against a wall clock then goes wrong by exactly the same
+# 8 hours, which is how it was eventually noticed.
+#
+# OpenWrt uses POSIX TZ notation, where the sign is inverted relative to the
+# offset people quote: east of Greenwich is CST-8, not CST+8.
+#
+# Guard: write only while the config still reads as untouched.  The board
+# shipped as GMT0 and stock OpenWrt ships UTC, so both spellings are accepted.
+# Anything else is the owner's own setting and is left alone — which is why this
+# needs no marker.
+configure_timezone() {
+	[ -f /etc/config/system ] || return 1
+
+	local tz zn
+	tz="$(uci -q get system.@system[0].timezone 2>/dev/null)"
+	zn="$(uci -q get system.@system[0].zonename 2>/dev/null)"
+
+	case "$tz" in
+		''|UTC|GMT|GMT0|Etc/UTC|Etc/GMT) ;;
+		*) return 1 ;;
+	esac
+	case "$zn" in
+		''|UTC|GMT|Etc/UTC|Etc/GMT) ;;
+		*) return 1 ;;
+	esac
+
+	uci -q set system.@system[0].timezone='CST-8'
+	uci -q set system.@system[0].zonename='Asia/Shanghai'
+	uci -q commit system
+	log "timezone: CST-8 / Asia/Shanghai (was '${tz}' / '${zn}')"
+	return 0
+}
+
+# ------------------------------------------------- qmodem-worker interval ----
+# See the note beside H5000M_QMODEM_WORKER_INTERVAL above: this is the knob that
+# decides how fast rpcd leaks on this board, because qmodem-worker is what drives
+# the external-script ubus method whose output buffer rpcd never frees.
+#
+# Written as a drop-in config file rather than by patching the qmodem package:
+# qmodem-worker reads /etc/qmodem-worker.conf, upstream does not ship that file,
+# and owning it here keeps the third-party package untouched and upgradeable.
+#
+# Guard: create only when absent.  An owner who has set their own interval keeps
+# it, a unit that already has the file is never rewritten, and the file is in
+# keep.d so sysupgrade preserves it — hence no marker.
+configure_worker_interval() {
+	[ -x /usr/sbin/qmodem-worker ] || return 1
+	[ -e /etc/qmodem-worker.conf ] && return 1
+
+	local v="${H5000M_QMODEM_WORKER_INTERVAL:-60}"
+	case "$v" in
+		''|*[!0-9]*) v=60 ;;
+	esac
+	# qmodem-worker clamps anything under 5 s itself; 15 s is the upstream
+	# default, so going below it here would defeat the purpose.
+	[ "$v" -lt 15 ] && v=15
+
+	printf '# Written on first boot by h5000m-firstboot.\n# Delete this file to fall back to the upstream default (15 s).\nQMODEM_WORKER_INTERVAL=%s\n' "$v" >/etc/qmodem-worker.conf
+	chmod 0644 /etc/qmodem-worker.conf
+	log "qmodem-worker: interval ${v}s (/etc/qmodem-worker.conf created)"
+
+	# The service starts at 96 and may already be running with the old value.
+	if [ -x /etc/init.d/qmodem-worker ]; then
+		/etc/init.d/qmodem-worker restart >/dev/null 2>&1
+	fi
+	return 0
+}
+
+# ------------------------------------------------------- rpcd memory guard ---
+# rpcd on this board leaks the output buffer of external-script ubus methods and
+# never gives it back (measured: 370-524 kB/min, ≈ 750 MB/day, which reached
+# 619 MB and left 18 MB available with load 21).  The watchdog restarts the
+# service above a 64 MB threshold; that restart was measured to cost nothing —
+# all 64 ubus objects come back and WiFi / 5G / the upgrade channel are
+# unaffected.
+#
+# The crontab entry is the only thing that has to exist for it to run at all, so
+# it is written idempotently rather than once: a marker would make an erased
+# crontab unrepairable by a reflash.
+#
+# What this will not do: touch any other crontab line.  It only appends.
+configure_guard() {
+	[ -x /usr/sbin/h5000m-rpcd-guard.sh ] || return 1
+
+	local ct='/etc/crontabs/root'
+	mkdir -p /etc/crontabs 2>/dev/null
+	[ -f "$ct" ] || : >"$ct"
+
+	if ! grep -qE '^[[:space:]]*[^#[:space:]].*h5000m-rpcd-guard\.sh' "$ct" 2>/dev/null; then
+		printf '* * * * * /usr/sbin/h5000m-rpcd-guard.sh\n' >>"$ct"
+		chmod 0600 "$ct" 2>/dev/null
+		log "rpcd guard: cron entry installed"
+		/etc/init.d/cron enable >/dev/null 2>&1
+		/etc/init.d/cron restart >/dev/null 2>&1
+	fi
+
+	/etc/init.d/cron enabled >/dev/null 2>&1 || /etc/init.d/cron enable >/dev/null 2>&1
+	return 0
+}
+
 main() {
 	# Each default is applied once, independently, and only after it actually
 	# took effect.  Re-running is safe either way — the guards inside make both
@@ -201,6 +345,14 @@ main() {
 			chmod 0600 "$MARKER_OFFLOAD"
 		fi
 	fi
+
+	# Idempotent and self-guarding, so these run on every invocation rather than
+	# behind a marker — see the note above MARKER_WIFI.  Between them they cost
+	# one uci read, one stat and one grep, and they are what repairs a unit whose
+	# timezone, worker interval or crontab was lost or never applied.
+	configure_timezone
+	configure_worker_interval
+	configure_guard
 
 	return 0
 }

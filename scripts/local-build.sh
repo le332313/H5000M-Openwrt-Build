@@ -335,8 +335,40 @@ H5000M_WIFI_SSID_5G="${H5000M_WIFI_SSID_5G:-${H5000M_WIFI_SSID}-5G}"
 H5000M_WIFI_KEY="${H5000M_WIFI_KEY:-H987654321}"
 H5000M_WIFI_COUNTRY="${H5000M_WIFI_COUNTRY:-CN}"
 H5000M_WIFI_ENCRYPTION="${H5000M_WIFI_ENCRYPTION:-sae-mixed}"
-H5000M_WIFI_HTMODE_2G="${H5000M_WIFI_HTMODE_2G:-EHT40}"
-H5000M_WIFI_HTMODE_5G="${H5000M_WIFI_HTMODE_5G:-EHT160}"
+H5000M_WIFI_HTMODE_2G="${H5000M_WIFI_HTMODE_2G:-EHT20}"
+H5000M_WIFI_HTMODE_5G="${H5000M_WIFI_HTMODE_5G:-EHT80}"
+# Both defaults used to be the widest the chip can do (EHT40 / EHT160), which is
+# the wrong trade on a real site rather than in a datasheet:
+#
+#   2.4 GHz has three non-overlapping channels (1/6/11), so EHT40 there ALWAYS
+#   overlaps a neighbour — it measures slower than 20 MHz wherever there is one,
+#   while raising retries for everyone around.  EHT20 is the honest setting.
+#
+#   5 GHz in CN is 36-64 plus 149-165, and 52-64 are DFS.  EHT160 out of 36
+#   necessarily spans 36-64, so the AP has to pass radar detection before it
+#   comes up and has to move channel if radar appears: "5 GHz missing for a
+#   while" and then "5 GHz dropped".  5.8 GHz is not contiguous, so 160 MHz
+#   cannot be had there instead.  EHT80 at 36 spans 36-48, all non-DFS — up
+#   immediately and never evicted.
+#
+# The EHT prefix is mandatory on this WiFi 7 target.  wifi-scripts rejects a
+# bare "HT80" outright, and a rejected htmode takes the entire radio down rather
+# than silently narrowing it (measured on the device: the 5 GHz AP vanished).
+#
+# These are defaults for a FRESH flash only — the first-boot script never
+# rewrites a radio whose SSID the owner has already changed.
+
+# qmodem-worker polling interval, in seconds.  This is the knob that sets how
+# fast rpcd leaks on this board.  rpcd never frees the output buffer of an
+# external-script ubus method, and qmodem is exactly such a method, so every call
+# leaks heap — and qmodem-worker is the source of ~98% of all qmodem calls
+# (measured by freezing it: qmodem invocations fell from 102 to 2 per 30 s).
+# At the upstream default of 15 s that is 370-524 kB/min ≈ 750 MB/day, which had
+# accumulated to 619 MB and taken `available` down to 18 MB with load 21.
+#
+# 60 s cuts the leak to roughly a quarter.  The worker's own cache TTL is 90 s,
+# so 60 s still refreshes well before a reading is treated as stale.
+H5000M_QMODEM_WORKER_INTERVAL="${H5000M_QMODEM_WORKER_INTERVAL:-60}"
 
 # Hardware acceleration.  On mainline this is the netfilter flowtable offload
 # driving the MTK PPE — the same hardware the vendor's TurboACC/hnat panel
@@ -2128,7 +2160,8 @@ write_h5000m_runtime_config() {
 	for var in H5000M_WIFI_SSID H5000M_WIFI_SSID_2G H5000M_WIFI_SSID_5G \
 		H5000M_WIFI_KEY H5000M_WIFI_COUNTRY \
 		H5000M_WIFI_ENCRYPTION H5000M_WIFI_HTMODE_2G H5000M_WIFI_HTMODE_5G \
-		H5000M_FLOW_OFFLOAD H5000M_FLOW_OFFLOAD_HW; do
+		H5000M_FLOW_OFFLOAD H5000M_FLOW_OFFLOAD_HW \
+		H5000M_QMODEM_WORKER_INTERVAL; do
 		val="${!var}"
 		case "$val" in
 			*"'"*) die "${var} contains a single quote — /etc/h5000m-defaults.conf would not be valid shell. Change the value and rebuild." ;;
@@ -2150,6 +2183,7 @@ H5000M_WIFI_HTMODE_2G='${H5000M_WIFI_HTMODE_2G}'
 H5000M_WIFI_HTMODE_5G='${H5000M_WIFI_HTMODE_5G}'
 H5000M_FLOW_OFFLOAD='${H5000M_FLOW_OFFLOAD}'
 H5000M_FLOW_OFFLOAD_HW='${H5000M_FLOW_OFFLOAD_HW}'
+H5000M_QMODEM_WORKER_INTERVAL='${H5000M_QMODEM_WORKER_INTERVAL}'
 EOF
 
 	# Root-only: this file carries the WiFi key in clear text, and the package

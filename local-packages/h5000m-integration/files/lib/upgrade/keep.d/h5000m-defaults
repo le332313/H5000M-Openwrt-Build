@@ -1,2 +1,3 @@
 /etc/h5000m-wifi-applied
 /etc/h5000m-offload-applied
+/etc/qmodem-worker.conf
