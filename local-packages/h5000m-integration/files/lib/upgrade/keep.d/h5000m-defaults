@@ -1,3 +1,5 @@
 /etc/h5000m-wifi-applied
 /etc/h5000m-offload-applied
 /etc/qmodem-worker.conf
+/etc/higoros/h5000m-devices-traffic.tsv
+/etc/higoros/higoros-devices-cache.json

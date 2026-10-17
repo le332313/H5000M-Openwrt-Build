@@ -328,6 +328,50 @@ configure_guard() {
 	return 0
 }
 
+# ------------------------------------------------ device ledger collector ---
+# The HigoOS "devices" page does not sample anything itself: it renders
+# /api/v1/devices, which is a plain read of /tmp/higoros-devices-cache.json
+# (persisted to /etc/higoros/higoros-devices-cache.json).
+#
+# higorosd's own device collector does not keep that file up to date on this
+# board.  Measured twice (boot, and after an explicit restart): the modem,
+# speed and traffic caches all refresh, while the device cache never gets its
+# first write — so the page stays empty forever, not just for a while.
+#
+# The inputs are all healthy, which is why a collector of our own works:
+#   /etc/usage.db      wrtbwmon, 10 columns, MAC/IP/traffic per client
+#   /tmp/dhcp.leases   names and lease validity
+#   iw ... station     wired vs wireless
+# See 5G-CPE-H5000M/设备管理页根因定案-20261016.md for the evidence.
+#
+# Same shape as configure_guard: the crontab line is the only thing that makes
+# it run, so it is appended idempotently rather than behind a marker — a marker
+# would make an erased crontab unrepairable by a reflash.
+configure_devices() {
+	[ -x /usr/sbin/h5000m-devices-collect.sh ] || return 1
+
+	local ct='/etc/crontabs/root'
+	mkdir -p /etc/crontabs 2>/dev/null
+	[ -f "$ct" ] || : >"$ct"
+
+	if ! grep -qE '^[[:space:]]*[^#[:space:]].*h5000m-devices-collect\.sh' "$ct" 2>/dev/null; then
+		printf '* * * * * /usr/sbin/h5000m-devices-collect.sh\n' >>"$ct"
+		chmod 0600 "$ct" 2>/dev/null
+		log "devices collector: cron entry installed"
+		/etc/init.d/cron enable >/dev/null 2>&1
+		/etc/init.d/cron restart >/dev/null 2>&1
+	fi
+
+	/etc/init.d/cron enabled >/dev/null 2>&1 || /etc/init.d/cron enable >/dev/null 2>&1
+
+	# Populate once right away: waiting up to a minute for the first tick
+	# looks exactly like the bug this is here to fix.
+	[ -f /tmp/higoros-devices-cache.json ] ||
+		/usr/sbin/h5000m-devices-collect.sh >/dev/null 2>&1 &
+
+	return 0
+}
+
 main() {
 	# Each default is applied once, independently, and only after it actually
 	# took effect.  Re-running is safe either way — the guards inside make both
@@ -353,6 +397,7 @@ main() {
 	configure_timezone
 	configure_worker_interval
 	configure_guard
+	configure_devices
 
 	return 0
 }
