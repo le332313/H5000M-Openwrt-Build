@@ -1120,9 +1120,12 @@ config PACKAGE_luci-app-ssr-plus_INCLUDE_Xray
 
 ```
 sing-box policy:
-  1.12.25-r1:  https://existyay.github.io/AutoBuild-H5000M-Openwrt/packages.adb
+  1.12.25-r1:  https://existyay.github.io/AutoBuild-H5000M-Openwrt/<abi>/packages.adb
   1.14.0-r1:   https://downloads.openwrt.org/snapshots/.../packages.adb   ← 会被选中
 ```
+
+（`<abi>` 是内核 vermagic，见本节末尾的"按 ABI 分目录"；这段输出是分目录之前采集的，
+当时索引直接放在站点根。）
 
 修法是给每个前端补一条**真实依赖**（`LUCI_DEPENDS+=`，插在 `include .../luci.mk`
 之前，`luci.mk:184` 的 `DEPENDS:=$(LUCI_DEPENDS)` 就会看到它）。`=m` 的包写 `+dep`
@@ -1151,9 +1154,57 @@ luci-app-momo       → momo sing-box
 > 且 stdout 非空"当作通过条件，并且逐条断言"某个前端确实拉到了某个核"。
 
 发布前门禁新增 `Verify the built repository can satisfy every frontend on its own`：
-只配置本仓库（不配官方源），用本机 apk 读**将被发布的** `artifacts/apk-repo/packages.adb`，
+只配置本仓库（不配官方源），用本机 apk 读**将被发布的** `artifacts/apk-repo/<abi>/packages.adb`，
 断言 15 个前端、12 个核/守护进程、20 个 kmod、12 个中文语言包都在索引里，
 `sing-box` 是 1.12.25，并且 10 个前端各自都能**解析出它需要的核**。
+
+其中 `<abi>` 取自本轮 `BUILD-INFO.txt` 的 `kernel_abi=`，**不取"目录里最新的那个"** ——
+残留的旧 ABI 目录如果更新，会让门禁验的是一个本轮根本没产出的仓库。
+
+### apk 仓库按内核 ABI 分目录（2026-10-17）
+
+**问题。** 仓库发布在**一个固定 URL** 上（GitHub Pages），而每台刷过本项目固件的设备都
+把这个地址写死在 `/etc/apk/repositories.d/50-h5000m.list` 里，且**永远改不掉**（只能重刷）。
+仓库是扁平的、只有一个 `packages.adb` 时，下一次构建会把它覆盖掉 —— 落后一个内核 ABI
+的设备读到的索引里全是它必须拒绝的 kmod。失败形状不是"某个包过期了"，而是
+`apk add luci-app-passwall` 解析出一个内核拒绝加载的 kmod，而屏幕上什么都不会说。
+
+**做法。** 目录按 ABI 分层，一个 ABI 一个目录、一个索引：
+
+```
+apk-repo/
+  <abi>/packages.adb     + 本次构建的全部 .apk
+  abi.txt                ← 本次发布填的是哪个 ABI 目录（publish 步骤写）
+  packages.adb           ← 兼容副本，内容是该 ABI 的索引
+  public-key.pem         ← 一把钥匙签所有 ABI 的索引，放根目录
+  firmware/              ← 一键升级通道，与之前相同
+```
+
+`<abi>` = `profiles.json` 的 `linux_kernel.vermagic`（本项目实测值
+`0c53a09af37f3986899893a223266bba` 一类的小写十六进制串），取值优先级：
+
+1. `$H5000M_KERNEL_ABI` —— CI 传进来
+2. `profiles.json` —— 构建结束后
+
+**没有第三个来源。** `CONFIG_LOCALVERSION` 是用户后缀，不是 ABI 哈希；拿它反推就是在编造值。
+两个来源都没有时函数返回空串，调用方**明确回退到扁平布局并告警**，不静默降级。
+
+**这里有一个无法回避的时序矛盾。** `50-h5000m.list` 是在 `install_local_packages` 阶段写进
+镜像的，**远早于** `profiles.json` 存在。所以镜像里的 ABI 只能靠构建前就知道的通道拿到：
+
+- **`--pinned` 构建**：pin 固定了一个内核 + 一份 config，vermagic 在 pin 有效期内是稳定的。
+  于是 CI 把 "pin 的 revision → ABI" 记进 `.abi`（`build.yml` 的
+  `Record the kernel ABI for the pinned revision` 步骤，只在**本轮编译的 revision 正好等于
+  当前 pin** 时写），下一次 pinned 构建开工前读它。
+- **非 pinned 构建**：树在动，ABI 编译完才知道。**不猜** —— 镜像回退扁平索引并告警，
+  但包仍然按真实 ABI 归档到对应目录，留给以后用。
+
+**★ 绝不能拿"上一次构建的 BUILD-INFO.txt"当 ABI 来源。** 它描述的是另一次构建，
+拿它当本轮的 ABI 会让镜像宣传一个它可能没有的 ABI 目录 —— 正好是分目录要防的那个失败，
+而且变成静默的。
+
+**兼容。** 站点根的 `packages.adb` 保留为本轮 ABI 索引的副本：已经刷过机的设备写在镜像里的
+就是这条路，它们没法就地改。这是兼容副本，不是规范位置。
 
 ---
 

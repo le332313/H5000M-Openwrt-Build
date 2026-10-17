@@ -67,7 +67,7 @@ Ruleset `master-protection`，**id `23816928`**，`current_user_can_bypass: neve
 | **CodeQL** | `security.yml::codeql` | `actions` + `javascript-typescript` 双语言矩阵，`security-extended`。产物在路由器上以 root 运行，值得更严格的查询集。 |
 | **Secret Scanning** | 仓库已启用 | provider patterns + **push protection** 均已开启（实测确认），密钥在推送时就被拦下。 |
 | **OpenSSF Scorecard** | `security.yml::scorecard` | 独立第三方视角检查仓库卫生（危险 workflow、未钉 action、分支保护）。仅默认分支运行，结果经 OIDC 发布。 |
-| **SLSA / Artifact Attestations** | `build.yml::Attest the firmware and the apk repository` | 为 `*squashfs-sysupgrade.bin` 与 `apk-repo/packages.adb` 签发 **build provenance**，任何人事后可验证"这个索引确实由该 commit 的该次运行产出"。 |
+| **SLSA / Artifact Attestations** | `build.yml::Attest the firmware and the apk repository` | 为 `*squashfs-sysupgrade.bin` 与 `apk-repo/<abi>/packages.adb`（以及站点根的兼容副本）签发 **build provenance**，任何人事后可验证"这个索引确实由该 commit 的该次运行产出"。 |
 | **SBOM** | `security.yml::attest` | 生成 SPDX SBOM 并随证明一起签发、作为 artifact 保留 90 天。 |
 | **Action Pinning** | 全部 workflow | **16 个 action 全部钉到 commit SHA**（tag 仅作注释）。已用 API 逐个核验 SHA 可解析回自身。Dependabot 每周分组升级——**SHA 钉定的可持续性依赖它**，否则会变成会腐烂的快照。 |
 

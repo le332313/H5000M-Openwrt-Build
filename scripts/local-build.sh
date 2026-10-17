@@ -394,6 +394,20 @@ H5000M_FLOW_OFFLOAD_HW="${H5000M_FLOW_OFFLOAD_HW:-1}"
 # exact value to build with, which is the quickest way to a working setup.
 H5000M_APK_REPO_URL="${H5000M_APK_REPO_URL:-}"
 
+# The kernel ABI this build will produce, so the source entry above can name a
+# per-ABI directory instead of one index that the next build overwrites.
+#
+# It has to be supplied BEFORE the build, because 50-h5000m.list is written into
+# the image at configuration time — long before profiles.json exists.  CI passes
+# the value it recorded for the pinned revision (see .abi in build.yml); a local
+# build can pass it by hand, or omit it and accept the flat fallback.
+#
+# Never derived from an already-built profiles.json: that file, if present at
+# all, belongs to a PREVIOUS build, and pointing the image at another kernel's
+# directory is worse than pointing at none.  Empty means "unknown", and
+# kernel_abi() says so rather than guessing.
+H5000M_KERNEL_ABI="${H5000M_KERNEL_ABI:-}"
+
 # --------------------------------------------------------------------- UI ----
 # Argon is the theme the H5000M builds in the wild use, and it is not in any
 # mainline feed, so it has to be cloned in.  Installing it is sufficient to make
@@ -742,7 +756,8 @@ show_features() {
 	else
 		log "First boot    : wifi2g=${H5000M_WIFI_SSID_2G} wifi5g=${H5000M_WIFI_SSID_5G} country=${H5000M_WIFI_COUNTRY} ${H5000M_WIFI_ENCRYPTION} offload=sw:${H5000M_FLOW_OFFLOAD}/hw:${H5000M_FLOW_OFFLOAD_HW}"
 	fi
-	log "apk source    : ${H5000M_APK_REPO_URL:-(none)}"
+	log "apk source    : ${H5000M_APK_REPO_URL:-(none)}${H5000M_APK_REPO_URL:+/${H5000M_KERNEL_ABI:+${H5000M_KERNEL_ABI}/}packages.adb}"
+	log "kernel ABI    : ${H5000M_KERNEL_ABI:-(unknown — flat index, the next build will overwrite it)}"
 	log "Optional      : upnp=${ENABLE_UPNP} adblock=${ENABLE_ADBLOCK} dockerman=${ENABLE_DOCKERMAN}"
 	log "Repo extras   : build=${ENABLE_REPO_PACKAGES} (services are =m unless their switch is on)"
 	log "Proxy/DNS     : nikki-rs=${ENABLE_NIKKI} openclash=${ENABLE_OPENCLASH} mosdns=${ENABLE_MOSDNS} homeproxy=${ENABLE_HOMEPROXY} adguardhome=${ENABLE_ADGUARDHOME}"
@@ -2195,14 +2210,27 @@ EOF
 	# anything with a kmod dependency fails there.  customfeeds.list is the
 	# file OpenWrt reserves for additions and explicitly survives sysupgrade.
 	if [ -n "${H5000M_APK_REPO_URL:-}" ]; then
+		# The index lives in a per-ABI directory so a later build cannot
+		# overwrite it out from under this device — see build_apk_repository
+		# for why that matters.  The ABI has to be known HERE, before anything
+		# is compiled, which is what $H5000M_KERNEL_ABI is for; without it the
+		# flat legacy path is written, and that is stated out loud rather than
+		# guessed at.
+		abi_here="$(kernel_abi)"
+		if [ -n "$abi_here" ]; then
+			idx_url="${H5000M_APK_REPO_URL%/}/${abi_here}/packages.adb"
+		else
+			idx_url="${H5000M_APK_REPO_URL%/}/packages.adb"
+			warn "Kernel ABI not known at image-configuration time (set H5000M_KERNEL_ABI); writing the flat index URL, which the next build for a different ABI will overwrite"
+		fi
 		{
 			printf '# This project'"'"'s own apk repository: every package from the same\n'
 			printf '# build as this firmware, so the kmods match this kernel ABI.\n'
-			printf '# The repository is the apk-repo/ artifact; serve that directory\n'
-			printf '# over HTTP(S) and point H5000M_APK_REPO_URL at it.\n'
-			printf '%s/packages.adb\n' "${H5000M_APK_REPO_URL%/}"
+			printf '# The index sits under a directory named after that ABI, so a build\n'
+			printf '# for a different kernel writes elsewhere and leaves this one intact.\n'
+			printf '%s\n' "$idx_url"
 		} >"${repo_dir}/50-h5000m.list"
-		log "Firmware apk source: ${H5000M_APK_REPO_URL%/}/packages.adb"
+		log "Firmware apk source: ${idx_url}"
 
 		# The web upgrade channel is published next to the repository, so the
 		# base URL is the same string with the index filename stripped.  Kept in
@@ -5125,16 +5153,74 @@ report_build_failure() {
 	return 0
 }
 
-# Assemble a single flat apk repository containing every package this build
-# produced, with one freshly generated index.
+# ------------------------------------------------------------ the kernel ABI ---
 #
-# Why flat rather than OpenWrt's <arch>/<feed>/ tree: the firmware has to be
-# told where the repository lives, and that list is written into the image
-# BEFORE anything is compiled (install_local_packages runs early), so it cannot
-# be derived from which feed directories ended up non-empty.  A flat repository
-# needs exactly one URL and one index, which removes that ordering problem
-# entirely — and removes the empty-feed problem with it, since there are no
-# per-feed directories to be empty.
+# The kernel ABI hash (vermagic) is the one string that decides whether a .apk
+# from a DIFFERENT build can be installed on this image.  Two builds of the same
+# pinned revision a week apart carry different hashes, because the hash covers
+# the kernel's own configuration and the toolchain.  So the repository has to be
+# able to say which ABI an index belongs to before it is published anywhere a
+# stale device might read it.
+#
+# Where it comes from: bin/targets/<board>/<subtarget>/profiles.json, key
+# linux_kernel.vermagic — the same key the official snapshot publishes and the
+# same one write_build_info() records as kernel_abi=.  Read with tr/sed, not
+# python3: a missing python3 must never be the reason the repository loses its
+# ABI directory.
+#
+# Order of preference:
+#   1. $H5000M_KERNEL_ABI   — CI exports what the build produced
+#   2. profiles.json        — after a full build (collect time)
+# Nothing else.  CONFIG_LOCALVERSION is the user's suffix, NOT the ABI hash;
+# deriving a hash from it would be inventing a value.  When neither source is
+# available these callers fall back to the flat, unversioned layout — loudly,
+# with a warning, never silently.
+kernel_abi() {
+	local abi="${H5000M_KERNEL_ABI:-}"
+	local profiles="${SRC}/bin/targets/${TARGET_BOARD}/${TARGET_SUBTARGET}/profiles.json"
+
+	if [ -z "$abi" ] && [ -s "$profiles" ]; then
+		# flatten the JSON with tr, then take the first hex token following
+		# "vermagic" — one value out of the document, no parser needed.
+		abi="$(tr '{},' '\n\n\n' <"$profiles" |
+			sed -n 's/.*"vermagic"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{8,\}\)".*/\1/p' |
+			head -n1)"
+	fi
+
+	# Only a lowercase hex token is accepted.  Anything else — an error page, a
+	# truncated file, a `null` — would become a directory name and a URL path.
+	case "$abi" in
+		"" | *[!0-9a-f]*) printf '' ;;
+		*) printf '%s' "$abi" ;;
+	esac
+}
+
+# Assemble one apk repository containing every package this build produced,
+# indexed once per kernel ABI.
+#
+# Layout — one directory per ABI, index inside it:
+#
+#   apk-repo/
+#     <abi>/packages.adb      + every .apk of that build
+#     firmware/               (staged later, untouched here)
+#     public-key.pem          (shared: one key signs every ABI's index)
+#
+# Why the ABI directory exists at all: the repository is published to ONE URL
+# (GitHub Pages), and every device flashed from this project keeps that URL
+# forever.  Flat, the next build overwrites the only index, so a device one
+# kernel ABI behind reads an index whose kmods it must reject — and the failure
+# is not "one package is stale", it is `apk add luci-app-passwall` resolving to
+# a kmod the running kernel refuses to load, with nothing on screen saying why.
+# With the ABI in the path a build writes only its own directory; older ABIs
+# stay downloadable and are simply no longer written to.
+#
+# Why not OpenWrt's <arch>/<feed> tree: the firmware has to be told where the
+# repository lives, and that list is written into the image BEFORE anything is
+# compiled (install_local_packages runs early), so it cannot be derived from
+# which feed directories ended up non-empty.  One ABI directory with one index
+# removes that ordering problem — and the ABI reaches the image through
+# $H5000M_KERNEL_ABI, which is why the flat fallback is kept instead of being
+# turned into a hard failure.
 #
 # Both package sets must be present for the repository to be useful:
 #   bin/packages/<arch>/<feed>/            architecture-generic packages
@@ -5145,18 +5231,33 @@ build_apk_repository() {
 	local dest="$1"
 	local repo="${dest}/apk-repo"
 	local apk_tool=""
-	local count
+	local count abi pkgdir
 
-	mkdir -p "$repo"
+	abi="$(kernel_abi)"
+	if [ -n "$abi" ]; then
+		pkgdir="${repo}/${abi}"
+		log "Kernel ABI ${abi}: packages go to apk-repo/${abi}/"
+	else
+		pkgdir="$repo"
+		warn "Kernel ABI unknown (no H5000M_KERNEL_ABI, no profiles.json): falling back to the flat layout, which the NEXT build overwrites"
+	fi
+
+	mkdir -p "$pkgdir"
+
+	# This tree is reused between runs (both the firmware tree and the build
+	# directory), so clear THIS ABI's directory: a re-run must not mix two
+	# builds' .apk files, observed once as base-files-1~f0d3e33.apk sitting
+	# next to base-files-1~d0d8c40.apk in one index.
+	find "$pkgdir" -maxdepth 1 -name '*.apk' -delete 2>/dev/null || true
 
 	# Collect from both locations.  cp -a on the tree would keep the per-feed
 	# directories; this flattens deliberately.
 	find "${SRC}/bin/packages/${TARGET_ARCH}" -mindepth 2 -maxdepth 2 -name '*.apk' \
-		-exec cp -f {} "$repo/" \; 2>/dev/null || true
+		-exec cp -f {} "$pkgdir/" \; 2>/dev/null || true
 	find "${SRC}/bin/targets/${TARGET_BOARD}/${TARGET_SUBTARGET}/packages" -maxdepth 1 -name '*.apk' \
-		-exec cp -f {} "$repo/" \; 2>/dev/null || true
+		-exec cp -f {} "$pkgdir/" \; 2>/dev/null || true
 
-	count="$(find "$repo" -maxdepth 1 -name '*.apk' | wc -l)"
+	count="$(find "$pkgdir" -maxdepth 1 -name '*.apk' | wc -l)"
 	if [ "$count" -eq 0 ]; then
 		warn "No .apk files found; the apk repository will be empty"
 		return 0
@@ -5195,23 +5296,28 @@ build_apk_repository() {
 	fi
 
 	# shellcheck disable=SC2046
-	"$apk_tool" mkndx --allow-untrusted "${sign_args[@]}" -o "${repo}/packages.adb" $(find "$repo" -maxdepth 1 -name '*.apk') ||
+	"$apk_tool" mkndx --allow-untrusted "${sign_args[@]}" -o "${pkgdir}/packages.adb" $(find "$pkgdir" -maxdepth 1 -name '*.apk') ||
 		die "apk mkndx failed — the repository would be unreadable"
 
 	if [ "${#sign_args[@]}" -gt 0 ]; then
-		log "Signed ${repo}/packages.adb with the build key"
+		log "Signed ${pkgdir}/packages.adb with the build key"
 	fi
 
 	# Ship the public key with the repository.  The publish job runs on a fresh
 	# runner with only this artifact — it has no openwrt/ tree to look in — so
 	# the key has to travel inside the artifact.  Devices flashed before the key
 	# was fixed fetch it from the same place as the index.
+	#
+	# One copy at the repository root, not one per ABI: the key signs every
+	# ABI's index, and devices are told to fetch it from the root.  The ABI
+	# directory therefore has to be self-contained for PACKAGES, but the key is
+	# a property of the project, not of a kernel.
 	if [ -f "${SRC}/public-key.pem" ]; then
 		cp -f "${SRC}/public-key.pem" "${repo}/public-key.pem"
 		log "Repository public key: ${repo}/public-key.pem"
 	fi
 
-	log "Built apk repository: ${count} packages, $(du -sh "$repo" | cut -f1)"
+	log "Built apk repository: ${count} packages in ${abi:+"ABI ${abi}"}${abi:-the flat root}, $(du -sh "$pkgdir" | cut -f1)"
 	return 0
 }
 
@@ -5290,6 +5396,12 @@ for name, val in (
 PY
 		)"
 	fi
+
+	# kernel_abi() is the fallback for the case python3 is absent: same key,
+	# read with tr/sed.  Nothing here invents a value — an absent profiles.json
+	# leaves the field out of BUILD-INFO.txt, and the CI ABI recorder then
+	# declines to record rather than writing a guess into .abi.
+	[ -n "${abi:-}" ] || abi="$(kernel_abi)"
 
 	# A shallow clone carries no tags, so scripts/getver.sh can only produce
 	# `r0-<sha>`: the revision counter is derived from the nearest base tag plus
