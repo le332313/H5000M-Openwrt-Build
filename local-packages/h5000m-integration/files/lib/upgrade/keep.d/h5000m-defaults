@@ -1,5 +1,29 @@
+# h5000m-integration 的升级保留清单
+#
+# 判据：只保留「运行期产生、重建不了或重建代价高」的东西。
+# 镜像里本来就有的文件不需要写在这里 —— sysupgrade 会自己装上新版本。
+#
+# ★ 2026-10-17 更正两处（本轮设备侧实测推翻了旧条目）：
+#
+#   删 /etc/higoros/h5000m-devices-traffic.tsv
+#     这是旧版采集器（v3）的台账路径。它落在 /etc/higoros/ 下会被
+#     higorosd 当成设备目录遍历（那个目录里每个文件的每一行都被当作
+#     一台设备），实测把 /api/v1/devices/traffic/ranking 污染成
+#     {"deviceId":"#mac,ip,total,in,out,last_date"} 这种垃圾条目，并且
+#     写进 state 的 firstSeen，重启都不掉。台账已改放 /etc/h5000m/。
+#     ⇒ 保留旧路径等于把污染源留着。
+#
+#   删 /etc/higoros/higoros-devices-cache.json
+#     这是 higorosd 的**开机种子**，不是运行时基线（运行时基线是
+#     /tmp/higoros-devices-state.json，tmpfs，本来就不跨升级）。
+#     保留旧种子会让新系统带着上一版的设备列表和流量值起步，
+#     而这些值是可以从 /etc/usage.db 现算出来的。
+#     ⇒ 不保留；采集器检测到缺失会补一份干净种子。
+#
+#   加 /etc/h5000m/
+#     采集器的新台账目录（devices-traffic.tsv）。纯旁路存档，留着有用。
+
 /etc/h5000m-wifi-applied
 /etc/h5000m-offload-applied
 /etc/qmodem-worker.conf
-/etc/higoros/h5000m-devices-traffic.tsv
-/etc/higoros/higoros-devices-cache.json
+/etc/h5000m

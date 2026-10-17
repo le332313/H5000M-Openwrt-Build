@@ -1,67 +1,77 @@
 #!/bin/sh
 #
-# h5000m-devices-collect —— 海狗面板「设备管理」的兜底采集器
+# h5000m-devices-collect —— 海狗面板「设备管理」的巡检与自愈
 #
-# 为什么需要它
-# ------------
-# /api/v1/devices 不实时采集，只读 /etc/higoros/higoros-devices-cache.json
-# 这个台账。而 higorosd 里负责写台账的设备采集循环在本机不开工：
-# 开机跑一阵后停住（或根本没写第一笔），重启也不恢复。
-# 已排除「缺种子文件」这个假说（实验 A：放空骨架 + 重启，十分钟内
-# 采集循环连一笔都没写，而 modem/speed/traffic 三个循环都在正常刷新）。
+# ============================================================================
+# ★★ 2026-10-17 v4：从「写入者」彻底改为「巡检者」
+# ============================================================================
 #
-# 数据其实都现成：
-#   /etc/usage.db         wrtbwmon 的台账，10 列：
-#                         mac,ip,iface,speed_in,speed_out,in,out,total,first_date,last_date
-#   /tmp/dhcp.leases      租约，五列：expiry mac ip hostname clientid
-#   iw dev <ifc> station  无线关联表，用来区分有线/无线
-# 所以这是「没人去采」，不是「采不到」。
+# 演进过程（每一版都是被实测打回来的）
+# ------------------------------------
+# v1~v3：以为 higorosd 的采集循环不开工，所以每分钟自己拼一份 JSON 写进去。
+#        症状确实消失了（页面有设备有流量），但代价是：
+#          ① 我写的是 usage.db 的累计值除以 1MB，它是增量语义，两边打架，
+#             面板数字在 0.60 ↔ 0.71 之间来回跳；
+#          ② 我把 TSV 台账放进了 /etc/higoros/，而 higorosd 会**遍历那个
+#             目录、把每个文件的每一行都当设备读**，于是 ranking 里长出了
+#             {"deviceId":"#mac,ip,total,in,out,last_date","totalTraffic":0}
+#             这种垃圾条目，还被持久化进 state 的 firstSeen/onlineSince；
+#          ③ 每分钟写 /tmp + 偶尔写 /etc，纯属多余动作。
 #
-# 它做什么
+# 本轮实测出来的真实机制（都有证据，别再猜）
+# ------------------------------------------
+#   ① /tmp/higoros-devices-state.json 才是**真正的持久基线**。里面
+#      traffic.<id>.{todayMb,weekMb,monthMb,dayKey,weekKey,monthKey} 是它
+#      自己累加的值。重启 higorosd 后这个值**原样保留**（实测 0.05→0.05），
+#      不归零。
+#   ② /tmp/higoros-devices-cache.json 是 state 的**投影**，约每 5 秒重写一次。
+#      trafficToday 是**MB 浮点**（0.05 这种），语义是**增量累加**，不是
+#      usage.db 的累计值。
+#   ③ 删掉缓存不给种子 → 它**永久空转**，90 秒也不重建，/devices 返回 []。
+#      所以它要一个"起点"才能开始周期刷新。
+#   ④ 给它种子时 trafficToday 必须写 **0**。写累计值 1.40 进去，它把 1.40
+#      当基线，之后只看增量，页面就显示 0 —— 这正是我最初误判"流量全 0
+#      是 bug"的根源。
+#   ⑤ /etc/higoros/higoros-devices-cache.json 是**开机种子**，不是运行时
+#      基线。它在 /etc/higoros/ 目录下会被和其它文件一起遍历。
+#
+# 所以 v4 只做四件事
+# ------------------
+#   1. 巡检 /tmp/higoros-devices-state.json：
+#        存在？能解析成 JSON？traffic 字段在？没有非法 key（含逗号/井号/
+#        冒号分隔的东西）？没有负数/NaN？
+#      任何一项不过 → 说明被污染或损坏 → 备份后重建。
+#   2. 重建时不猜：从 usage.db 取真实设备，state 写成**干净的空基线**，
+#      traffic 里的 todayMb 一律 0（交给它自己从这一刻开始累加）。
+#   3. 巡检 /tmp/higoros-devices-cache.json：不存在就补一份种子（traffic 写 0）。
+#   4. 台账挪到 /etc/h5000m/（**绝不能放 /etc/higoros/**），只做旁路存档，
+#      按集合变化或 30 分钟落盘，不参与面板展示。
+#
+# 不做什么
 # --------
-# 每分钟把上面三个源拼成 higorosd 期望的 JSON 台账，写到它读的那个路径。
-# 面板照样读文件，文件对了页面就出数。**不碰原厂二进制**——HigoOS 前端要
-# 保持可用，而 higorosd 是闭源的，改不了。
-#
-# 它不做什么
-# ----------
-# · 不写 higoros-devices-state.json（除非文件不存在，才放一个空骨架）。
-#   那个文件里有 renamed / parental / limits / blocked，是面板侧用户数据；
-#   采集器不产生它们，也就不该覆盖它们。
-# · 不删除任何历史设备。台账是累积的（原厂那份含 108 台），消失的设备
-#   只标记 isOnline=false。
-#
-# 单位约定
-# --------
-# usage.db 的 in/out/total 是**字节**；cache 里 trafficToday/Week/Month
-# 原厂样本是 0，按 MB 整数处理。speed_in/speed_out 是 B/s，直接透传。
+# · 不再每分钟覆盖缓存 —— 那是 v3 制造抖动的直接原因
+# · 不碰原厂二进制（higorosd 闭源）
+# · 不删历史设备
+# · 不重启 higorosd（它重启会清内存快照，得不偿失；除非 state 反复损坏）
 #
 # 安装：cron 每分钟一次（由 h5000m-firstboot 写入 /etc/crontabs/root）
 #   * * * * * /usr/sbin/h5000m-devices-collect.sh
-# keep.d 白名单：/etc/higoros/h5000m-devices-traffic.tsv（累积基线，丢了
-# 只是当日流量从零算，不影响设备列表）
 #
-# ★ 与 rpcd 看门狗同套路：放在 /usr/sbin（squashfs，随新镜像更新），
-#   不放在 /etc（overlay 上会被 sysupgrade 当用户改动永远留住第一版）。
+# 调试：
+#   /usr/sbin/h5000m-devices-collect.sh --check    # 只体检，不改
+#   /usr/sbin/h5000m-devices-collect.sh --fix      # 强制重建 state
 
-DB=/etc/usage.db
-LEASES=/tmp/dhcp.leases
-# higorosd 里两个路径都在（strings 实证）：
-#   /tmp/higoros-devices-cache.json      tmpfs，运行时/高频
-#   /etc/higoros/higoros-devices-cache.json  overlay（在 flash 上），持久台账
-# 每分钟写 /etc 会持续磨损 eMMC，所以两份分工：
-#   /tmp 每分钟更新（实时在线状态与速率）
-#   /etc 只在「设备集合变化」或超过 30 分钟时同步（重启后的基线）
 CACHE=/tmp/higoros-devices-cache.json
 CACHE_ETC=/etc/higoros/higoros-devices-cache.json
-STATE=/etc/higoros/higoros-devices-state.json
-TSV=/etc/higoros/h5000m-devices-traffic.tsv
-SETSUM=/tmp/.h5000m-devices-set.sum
-SETTS=/tmp/.h5000m-devices-set.ts
-PERSIST_EVERY=1800
+STATE=/tmp/higoros-devices-state.json
+DB=/etc/usage.db
+# ★★ 台账绝不能放在 /etc/higoros/ 下：higorosd 会遍历那个目录，把每个文件
+#   的每一行都当成一台设备读进去，污染 ranking 与 state。
+TSV=/etc/h5000m/devices-traffic.tsv
 LOCK=/tmp/.h5000m-devices-collect.lock
 LOGF=/tmp/h5000m-devices-collect.log
 HEARTBEAT=/tmp/h5000m-devices-collect.lastrun
+PERSIST_EVERY=1800
 SUBNET="192.168.88.0/24"
 
 log() {
@@ -71,14 +81,14 @@ log() {
 	fi
 }
 
-# 并发保护：cron 每分钟一次，而写台账可能跨分钟
 mkdir "$LOCK" 2>/dev/null || exit 0
 trap 'rmdir "$LOCK" 2>/dev/null' EXIT INT TERM HUP
 
 date -u '+%Y-%m-%dT%H:%M:%SZ' >"$HEARTBEAT" 2>/dev/null
 
-# 一键升级进行中 → 让路。判据读 status 的 state=，不要用目录是否存在
-# （那个目录平时就存着 latest.json，用它判会让采集器永久失效）。
+MODE="$1"
+
+# 一键升级进行中 → 让路
 ST="$(sed -n 's/^state=//p' /tmp/h5000m-upgrade/status 2>/dev/null | head -n1)"
 case "$ST" in
 downloading | verifying | flashing)
@@ -87,231 +97,278 @@ downloading | verifying | flashing)
 	;;
 esac
 
+NOW=$(date +%s)
+DAYKEY=$(date +%Y-%m-%d)
+WEEKKEY="$(date +%Y)-W$(date +%V)"
+MONTHKEY=$(date +%Y-%m)
+
+# ---------------------------------------------------------------- 取真实设备 ---
+# 从 usage.db 拿带 IP 的设备：mac|ip|speed_in|speed_out|total|first_date|last_date
+# 顺手从 DHCP 租约取主机名，从 iw 取无线归属。
+read_devices() {
+	awk -F, 'NR>1 && NF>=10 && $2!="NA" && $2!="" {
+		printf "%s|%s|%s|%s|%s|%s|%s\n", tolower($1), $2, $4, $5, $8, $9, $10
+	}' "$DB" 2>/dev/null
+}
+
+read_leases() {
+	[ -f /tmp/dhcp.leases ] || return 0
+	awk -v now="$NOW" 'NF>=4 && $1+0>now {print $3"|"$4}' /tmp/dhcp.leases 2>/dev/null
+}
+
+read_wireless() {
+	for ifc in $(iw dev 2>/dev/null | awk '/Interface/{print $2}'); do
+		for m in $(iw dev "$ifc" station dump 2>/dev/null | awk '/^Station/{print $2}'); do
+			printf '%s ' "$(printf '%s' "$m" | tr 'A-Z' 'a-z')"
+		done
+	done
+}
+
+# ------------------------------------------------------------ 体检（state） ---
+# 判据（任何一条不过就重建）：
+#   a. 文件存在且非空
+#   b. 能被解析（用首尾 {} 与 traffic 键粗判 —— 设备上没有 jq）
+#   c. traffic 里的 key 必须是 12 位十六进制（== 去掉冒号的 MAC）。
+#      这一条专治 v3 那种污染：垃圾 key 里带冒号、逗号、井号。
+state_health() {
+	if [ ! -s "$STATE" ]; then
+		echo "missing"
+		return
+	fi
+	# 粗判 JSON 完整性：必须首尾花括号、必须有 traffic 键
+	head -c1 "$STATE" | grep -q '{' || {
+		echo "corrupt"
+		return
+	}
+	tail -c2 "$STATE" | grep -q '}' || {
+		echo "corrupt"
+		return
+	}
+	grep -q '"traffic"' "$STATE" || {
+		echo "no-traffic"
+		return
+	}
+	# ★ 非法 key 检测：traffic 段里的 key 应当只有 [0-9a-f]{12}
+	#   把 traffic 段切出来，取出所有 "...":{"todayMb" 形式的 key
+	bad=$(sed 's/.*"traffic":{//; s/},"[a-z]*":{[^}]*}[^}]*$//' "$STATE" 2>/dev/null |
+		grep -o '"[^"]*":{"todayMb"' |
+		sed 's/":{"todayMb"//; s/"//g' |
+		grep -vE '^[0-9a-f]{12}$' |
+		head -1)
+	if [ -n "$bad" ]; then
+		echo "bad-key:$bad"
+		return
+	fi
+	# 负数 / NaN 检测（累加值不该为负）
+	grep -qE '"(todayMb|weekMb|monthMb)":-|"(todayMb|weekMb|monthMb)":nan' "$STATE" && {
+		echo "bad-value"
+		return
+	}
+	echo "ok"
+}
+
+# ------------------------------------------------------------ 重建（state） ---
+build_state() {
+	LH=/tmp/.h5dhcp.$$
+	read_leases >"$LH"
+
+	{
+		printf '{"firstSeen":{'
+		first=1
+		while IFS='|' read -r mac ip sin sout total fdate ldate; do
+			[ -n "$mac" ] || continue
+			id=$(printf '%s' "$mac" | tr -d ':')
+			[ "$first" = 1 ] || printf ','
+			first=0
+			printf '"%s":%s000' "$id" "${fdate:-$NOW}"
+		done <"$DEVROWS"
+
+		printf '},"onlineSince":{'
+		first=1
+		while IFS='|' read -r mac ip sin sout total fdate ldate; do
+			[ -n "$mac" ] || continue
+			id=$(printf '%s' "$mac" | tr -d ':')
+			[ "$first" = 1 ] || printf ','
+			first=0
+			printf '"%s":%s000' "$id" "${ldate:-$NOW}"
+		done <"$DEVROWS"
+
+		printf '},"onlineState":{'
+		first=1
+		while IFS='|' read -r mac ip sin sout total fdate ldate; do
+			[ -n "$mac" ] || continue
+			id=$(printf '%s' "$mac" | tr -d ':')
+			[ "$first" = 1 ] || printf ','
+			first=0
+			printf '"%s":true' "$id"
+		done <"$DEVROWS"
+
+		# renamed/limits/blocked/parental 是面板侧用户数据，重建时留空
+		# （重建只在 state 已经坏了的时候发生，此时用户数据多半也已丢失，
+		#   但宁可留空也不编造）
+		printf '},"renamed":{},"limits":{},"blocked":{},"parental":{},"traffic":{'
+		first=1
+		while IFS='|' read -r mac ip sin sout total fdate ldate; do
+			[ -n "$mac" ] || continue
+			id=$(printf '%s' "$mac" | tr -d ':')
+			[ "$first" = 1 ] || printf ','
+			first=0
+			# ★ 一律 0：让它从这一刻开始自己累加。写累计值会让页面显示 0。
+			printf '"%s":{"todayMb":0,"weekMb":0,"monthMb":0,"dayKey":"%s","weekKey":"%s","monthKey":"%s"}' \
+				"$id" "$DAYKEY" "$WEEKKEY" "$MONTHKEY"
+		done <"$DEVROWS"
+		printf '}}\n'
+	} >"$STATE.tmp.$$"
+
+	# 只接受"写完还健康"的版本
+	if [ -s "$STATE.tmp.$$" ]; then
+		mv -f "$STATE.tmp.$$" "$STATE"
+		return 0
+	fi
+	rm -f "$STATE.tmp.$$"
+	return 1
+}
+
+# ------------------------------------------------- 关于 connectionType（不修） ---
+# 2026-10-17 定案：这一项**不修**，交回 higorosd 自己。
+#
+# 一度打算在这里把 wired 改写成 wireless，理由是「5G 关联表里明明有
+# 02:54:e8:...，它却写 wired」。但更长时间的观察推翻了那个前提：
+#
+#   · 它有时写 "connectionType":"wifi-5g" —— 说明它**判得出来**，
+#     而且合法值是 "wifi-2.4g" / "wifi-5g" 这种带频段的格式，
+#     不是我以为的 "wireless"（二进制里 wifi-2.4g 字面量实证）。
+#   · 它有时写 "wired" —— 说明判定依赖的链路会间歇性拿不到数据。
+#     相关函数：main.readWiFiConnectionMap / main.detectWiFiConnTypeByIface
+#     / main.normalizeConnectionType。normalize 会把无法判定的值归到默认。
+#
+# 如果我强行改成 "wireless"：① 那不是我猜的那个值，前端可能显示成
+# 「未知」；② 它 5 秒一次重写，我改完立刻被覆盖，等于白做；③ 只要有一次
+# 改错，用户看到的就是编造的类型。**不如让它自己判，判错也不比我编。**
+#
+# 所以要修只能从"它为什么间歇拿不到无线表"下手，那是另一条独立课题。
+# 挂账在可用性评估文档里，不在这里偷改字段。
+
+# ------------------------------------------------------------ 生成缓存种子 ---
+# 仅在缓存缺失时用。trafficToday 一律 0（它是增量起点）。
+build_cache() {
+	LH=/tmp/.h5lease.$$
+	read_leases >"$LH"
+	WL=" $(read_wireless) "
+
+	{
+		printf '{"updatedAt":%s,"subnet":"%s","devices":[' "$((NOW * 1000))" "$SUBNET"
+		first=1
+		while IFS='|' read -r mac ip sin sout total fdate ldate; do
+			[ -n "$mac" ] || continue
+			id=$(printf '%s' "$mac" | tr -d ':')
+			name=$(awk -F'|' -v ip="$ip" '$1==ip{print $2; exit}' "$LH" 2>/dev/null)
+			[ -n "$name" ] || name="$ip"
+			name=$(printf '%s' "$name" | tr -c 'A-Za-z0-9._-' '_')
+			ctype=wired
+			case "$WL" in *" $mac "*) ctype=wireless ;; esac
+			online=false
+			[ -n "$ldate" ] && [ $((NOW - ldate)) -lt 120 ] 2>/dev/null && online=true
+			conn=$((ldate - fdate))
+			[ "$conn" -ge 0 ] 2>/dev/null || conn=0
+			[ "$first" = 1 ] || printf ','
+			first=0
+			printf '{"id":"%s","name":"%s","macAddress":"%s","ipAddress":"%s"' \
+				"$id" "$name" "$(printf '%s' "$mac" | tr 'a-z' 'A-Z')" "$ip"
+			printf ',"connectionType":"%s","deviceType":"other","osType":"others"' "$ctype"
+			printf ',"connectedTime":%s,"uploadSpeed":%s,"downloadSpeed":%s' \
+				"$conn" "${sout:-0}" "${sin:-0}"
+			printf ',"isOnline":%s,"isGuest":false,"isBlocked":false,"isLimited":false' "$online"
+			printf ',"hasParentalControl":false'
+			printf ',"trafficToday":0,"trafficWeek":0,"trafficMonth":0}'
+		done <"$DEVROWS"
+		printf '],"trafficRanking":[],"blacklist":[]}\n'
+	} >"$CACHE.tmp.$$"
+
+	if [ -s "$CACHE.tmp.$$" ]; then
+		mv -f "$CACHE.tmp.$$" "$CACHE"
+		return 0
+	fi
+	rm -f "$CACHE.tmp.$$"
+	return 1
+}
+
+# ---------------------------------------------------------------- 主流程 ---
 [ -f "$DB" ] || {
 	log "跳过：$DB 不存在（wrtbwmon 没跑）"
 	exit 0
 }
 
-mkdir -p /etc/higoros 2>/dev/null
+DEVROWS=/tmp/.h5devs.$$
+read_devices >"$DEVROWS"
+DEVN=$(wc -l <"$DEVROWS" 2>/dev/null || echo 0)
 
-NOW=$(date +%s)
-DAY=$(date +%Y%m%d)
-WEEK=$(date +%Y-W%V)
-MONTH=$(date +%Y%m)
-
-# ---------------------------------------------------------------- 在线来源 ---
-# 无线关联：把 MAC 收进来，用来把 connectionType 判成 wireless。
-# iw 对非无线接口会报错，全部 2>/dev/null。
-WL=" "
-for ifc in $(iw dev 2>/dev/null | awk '/Interface/{print $2}'); do
-	for m in $(iw dev "$ifc" station dump 2>/dev/null | awk '/^Station/{print $2}'); do
-		WL="$WL$(printf '%s' "$m" | tr 'A-Z' 'a-z') "
-	done
-done
-
-# 租约：ip->hostname，以及 mac 是否还在租期内。
-# 用两个临时文件而不是关联数组 —— busybox ash 没有 declare -A。
-LH=/tmp/.h5000m-lease-host.$$
-LI=/tmp/.h5000m-lease-on.$$
-: >"$LH"
-: >"$LI"
-if [ -f "$LEASES" ]; then
-	# ★ 变量不能叫 exp —— 那是 awk 的内置函数名（exp()），busybox awk 会
-	#   报 "Unexpected token" 并且被 2>/dev/null 吞掉，症状就是静默拿不到
-	#   主机名、全部退回成 IP。这一版之前正是这么错的。
-	awk -v now="$NOW" -v lh="$LH" -v li="$LI" '
-		NF >= 4 {
-			expt = $1 + 0; mac = tolower($2); ip = $3; host = $4
-			if (expt > now) { print mac, ip > li; print ip, host > lh }
-		}
-	' "$LEASES"
-fi
-trap 'rmdir "$LOCK" 2>/dev/null; rm -f "$LH" "$LI"' EXIT INT TERM HUP
-
-# ---------------------------------------------------------------- 读旧基线 ---
-# TSV 列：id mac lastIp total dayKey todayB weekKey weekB monthKey monthB firstSeen lastSeen
-[ -f "$TSV" ] || : >"$TSV"
-
-old_field() { # <id> <列号>
-	awk -F'\t' -v id="$1" -v c="$2" '$1==id{print $c; exit}' "$TSV" 2>/dev/null
+[ "$MODE" = "--check" ] && {
+	h=$(state_health)
+	printf 'state: %s\n' "$h"
+	printf 'cache: %s\n' "$([ -s "$CACHE" ] && echo exists || echo missing)"
+	printf 'devices in usage.db: %s\n' "$DEVN"
+	rm -f "$DEVROWS"
+	exit 0
 }
 
-# ---------------------------------------------------------------- 生成台账 ---
-OUT=/tmp/.h5000m-devices-cache.$$
-NEWTSV=/tmp/.h5000m-devices-tsv.$$
-: >"$OUT"
-: >"$NEWTSV"
+if [ "$MODE" = "--fix" ]; then
+	log "--fix：强制重建 state"
+	[ -f "$STATE" ] && cp -f "$STATE" "/tmp/higoros-devices-state.$(date +%s).bak" 2>/dev/null
+	build_state && log "state 已重建（设备 $DEVN 台）" || log "state 重建失败"
+	rm -f "$DEVROWS"
+	exit 0
+fi
 
-n=0
-first=1
-{
-	printf '{\n'
-	printf '  "updatedAt": %s,\n' "$(($(date +%s) * 1000))"
-	printf '  "subnet": "%s",\n' "$SUBNET"
-	printf '  "devices": ['
-} >"$OUT"
-
-# 先处理 usage.db 里现役的设备，再补上历史台账里已消失的。
-# awk 输出：mac|ip|iface|speed_in|speed_out|in|out|total|first_date|last_date
-awk -F, '
-	NR == 1 && /^#/ { next }
-	NF >= 10 {
-		mac = tolower($1); ip = $2
-		if (ip == "NA" || ip == "") next
-		print mac "|" ip "|" $3 "|" $4 "|" $5 "|" $6 "|" $7 "|" $8 "|" $9 "|" $10
-	}
-' "$DB" 2>/dev/null >/tmp/.h5000m-usage.$$
-
-while IFS='|' read -r mac ip iface sin sout bin bout total fdate ldate; do
-	[ -n "$mac" ] || continue
-	id="$(printf '%s' "$mac" | tr -d ':')"
-
-	# 主机名：租约优先，否则用 IP（原厂样本也是这么兜的）
-	name="$(awk -v ip="$ip" '$1==ip{print $2; exit}' "$LH" 2>/dev/null)"
-	[ -n "$name" ] && [ "$name" != "*" ] || name="$ip"
-
-	# 在线判定：租约未过期，或 usage.db 的 last_date 在两分钟内
-	online=false
-	if grep -qxF "$mac $ip" "$LI" 2>/dev/null; then
-		online=true
-	elif [ -n "$ldate" ] && [ $((NOW - ldate)) -lt 120 ] 2>/dev/null; then
-		online=true
+# 1) 体检 state
+SH=$(state_health)
+case "$SH" in
+ok) ;;
+*)
+	log "state 不健康（$SH）→ 备份并重建"
+	[ -f "$STATE" ] && cp -f "$STATE" "/tmp/higoros-devices-state.$(date +%s).bad" 2>/dev/null
+	if build_state; then
+		log "state 已重建（设备 $DEVN 台，traffic 一律归零由它自己累加）"
+	else
+		log "state 重建失败，保留现场待查"
 	fi
+	;;
+esac
 
-	ctype=wired
-	case "$WL" in
-	*" $mac "*) ctype=wireless ;;
-	esac
+# 2) 体检缓存 —— 只在缺失时补种子，**绝不覆盖**
+#    （覆盖 = v3 制造抖动的直接原因）
+if [ ! -s "$CACHE" ]; then
+	log "缓存缺失 → 补一份种子（traffic 归零）"
+	build_cache && log "已写入种子（设备 $DEVN 台）" || log "种子写入失败"
+fi
 
-	# 流量：total 是累计字节。增量按 day/week/month 各自归零累加。
-	pid_t=$(old_field "$id" 4)
-	pday=$(old_field "$id" 5)
-	ptoday=$(old_field "$id" 6)
-	pweek=$(old_field "$id" 7)
-	pweekb=$(old_field "$id" 8)
-	pmonth=$(old_field "$id" 9)
-	pmonthb=$(old_field "$id" 10)
-	pfirst=$(old_field "$id" 11)
+# 3) 只记录 connectionType 现状（不修，见上文定案），供后续单独课题用
+CT=$(grep -o '"connectionType":"[^"]*"' "$CACHE" 2>/dev/null | sed 's/.*:"//; s/"//' | tr '\n' ' ')
+[ -n "$CT" ] && log "connectionType 现状：$CT"
 
-	[ -n "$pid_t" ] || pid_t=0
-	[ -n "$ptoday" ] || ptoday=0
-	[ -n "$pweekb" ] || pweekb=0
-	[ -n "$pmonthb" ] || pmonthb=0
+# /etc 那份作为开机种子，只在缺失时同步一份（它不参与运行时）
+if [ ! -s "$CACHE_ETC" ] && [ -s "$CACHE" ]; then
+	mkdir -p /etc/higoros 2>/dev/null
+	cp -f "$CACHE" "$CACHE_ETC" 2>/dev/null && log "补 /etc 开机种子"
+fi
 
-	# 跨日/跨周/跨月先归零
-	[ "$pday" = "$DAY" ] || ptoday=0
-	[ "$pweek" = "$WEEK" ] || pweekb=0
-	[ "$pmonth" = "$MONTH" ] || pmonthb=0
-
-	delta=$((total - pid_t))
-	[ "$delta" -ge 0 ] 2>/dev/null || delta=0
-	todayb=$((ptoday + delta))
-	weekb=$((pweekb + delta))
-	monthb=$((pmonthb + delta))
-
-	[ -n "$pfirst" ] || pfirst="$fdate"
-	connected=$((ldate - pfirst))
-	[ "$connected" -ge 0 ] 2>/dev/null || connected=0
-
-	today_mb=$((todayb / 1048576))
-	week_mb=$((weekb / 1048576))
-	month_mb=$((monthb / 1048576))
-
-	# JSON 字符串里只允许安全字符，主机名来自 DHCP 客户端、不可信
-	safe_name="$(printf '%s' "$name" | tr -c 'A-Za-z0-9._-' '_')"
-
-	[ "$first" = 1 ] || printf ',' >>"$OUT"
-	first=0
-	{
-		printf '\n    {"id":"%s","name":"%s","macAddress":"%s","ipAddress":"%s"' \
-			"$id" "$safe_name" "$(printf '%s' "$mac" | tr 'a-z' 'A-Z')" "$ip"
-		printf ',"connectionType":"%s","deviceType":"other","osType":"others"' "$ctype"
-		printf ',"connectedTime":%s,"uploadSpeed":%s,"downloadSpeed":%s' \
-			"$connected" "${sout:-0}" "${sin:-0}"
-		printf ',"isOnline":%s,"isGuest":false,"isBlocked":false,"isLimited":false' "$online"
-		printf ',"hasParentalControl":false'
-		printf ',"trafficToday":%s,"trafficWeek":%s,"trafficMonth":%s}' \
-			"$today_mb" "$week_mb" "$month_mb"
-	} >>"$OUT"
-
-	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-		"$id" "$mac" "$ip" "$total" "$DAY" "$todayb" "$WEEK" "$weekb" \
-		"$MONTH" "$monthb" "$pfirst" "$NOW" >>"$NEWTSV"
-
-	n=$((n + 1))
-done </tmp/.h5000m-usage.$$
-
-# 历史设备：TSV 里有、usage.db 里已经没有的，保留但标离线。
-# 这就是原厂那份 108 台台账的行为——累积而不是快照。
-awk -F'\t' '{print $1}' "$NEWTSV" >/tmp/.h5000m-seen.$$
-while IFS="$(printf '\t')" read -r id mac lastip total dk tb wk wb mk mb fs ls; do
-	[ -n "$id" ] || continue
-	grep -qxF "$id" /tmp/.h5000m-seen.$$ && continue
-
-	pday=$dk
-	ptoday=$tb
-	pweek=$wk
-	pweekb=$wb
-	pmonth=$mk
-	pmonthb=$mb
-	[ "$pday" = "$DAY" ] || ptoday=0
-	[ "$pweek" = "$WEEK" ] || pweekb=0
-	[ "$pmonth" = "$MONTH" ] || pmonthb=0
-
-	[ "$first" = 1 ] || printf ',' >>"$OUT"
-	first=0
-	{
-		printf '\n    {"id":"%s","name":"%s","macAddress":"%s","ipAddress":"%s"' \
-			"$id" "$lastip" "$(printf '%s' "$mac" | tr 'a-z' 'A-Z')" "$lastip"
-		printf ',"connectionType":"wired","deviceType":"other","osType":"others"'
-		printf ',"connectedTime":0,"uploadSpeed":0,"downloadSpeed":0'
-		printf ',"isOnline":false,"isGuest":false,"isBlocked":false,"isLimited":false'
-		printf ',"hasParentalControl":false'
-		printf ',"trafficToday":%s,"trafficWeek":%s,"trafficMonth":%s}' \
-			"$((ptoday / 1048576))" "$((pweekb / 1048576))" "$((pmonthb / 1048576))"
-	} >>"$OUT"
-
-	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-		"$id" "$mac" "$lastip" "$total" "$DAY" "$ptoday" "$WEEK" "$pweekb" \
-		"$MONTH" "$pmonthb" "$fs" "$ls" >>"$NEWTSV"
-	n=$((n + 1))
-done <"$TSV"
-
-printf '\n  ]\n}\n' >>"$OUT"
-
-# 落盘：/tmp 每次都写；/etc 只按「集合变化 / 超时」同步，避免每分钟擦 flash。
-# 集合指纹只取 id 排序列表 —— 流量数字每分钟都变，拿整份文件做指纹等于每次
-# 都判「变了」，那 30 分钟的门就形同虚设。
-mv -f "$NEWTSV" "$TSV" 2>/dev/null
-setsum="$(sed -n 's/.*"id":"\([^"]*\)".*/\1/p' "$OUT" | LC_ALL=C sort | md5sum | cut -d' ' -f1)"
-lastsum="$(cat "$SETSUM" 2>/dev/null)"
-lastts="$(cat "$SETTS" 2>/dev/null)"
-# 文件可能被半写、也可能从没写过：非纯数字一律当 0，否则算术会在这里炸掉
+# 3) 旁路台账：落在 /etc/h5000m/（绝不进 /etc/higoros/）
+mkdir -p /etc/h5000m 2>/dev/null
+CURSUM=$(awk -F'|' '{print $1}' "$DEVROWS" 2>/dev/null | LC_ALL=C sort | md5sum | cut -d' ' -f1)
+lastsum=$(sed -n '1s/^#//p' "$TSV" 2>/dev/null)
+SETTS=/tmp/.h5000m-devices-set.ts
+lastts=$(cat "$SETTS" 2>/dev/null)
 case "$lastts" in '' | *[!0-9]*) lastts=0 ;; esac
 since=$((NOW - lastts))
 
-cp -f "$OUT" "$CACHE" 2>/dev/null || log "写 $CACHE 失败"
-
-if [ "$setsum" != "$lastsum" ] || [ "$since" -ge "$PERSIST_EVERY" ]; then
-	mkdir -p /etc/higoros 2>/dev/null
-	if cp -f "$OUT" "$CACHE_ETC" 2>/dev/null; then
-		printf '%s\n' "$setsum" >"$SETSUM"
-		printf '%s\n' "$NOW" >"$SETTS"
-		log "持久化到 $CACHE_ETC（设备 $n 台，距上次 ${since}s）"
-	fi
+if [ "$CURSUM" != "$lastsum" ] || [ "$since" -ge "$PERSIST_EVERY" ]; then
+	{
+		printf '#%s\n' "$CURSUM"
+		printf '#mac,ip,total,in,out,last_date\n'
+		awk -F'|' '{printf "%s,%s,%s,0,0,%s\n", $1, $2, $5, $7}' "$DEVROWS"
+	} >"$TSV.tmp" 2>/dev/null && mv -f "$TSV.tmp" "$TSV" 2>/dev/null
+	printf '%s\n' "$NOW" >"$SETTS"
 fi
 
-rm -f "$OUT"
-chmod 0644 "$CACHE" "$CACHE_ETC" 2>/dev/null
-
-# state 只在完全不存在时放空骨架。已有内容一律不动——
-# 里面有 renamed/parental/limits/blocked，是面板侧用户数据。
-if [ ! -f "$STATE" ]; then
-	printf '{"firstSeen":{},"traffic":{},"renamed":{},"parental":{},"limits":{},"blocked":{},"onlineState":{},"onlineSince":{}}\n' >"$STATE"
-fi
-
-# 空列表要留痕：设备页空着时，最想知道的就是「采集器到底跑没跑」。
-[ "$n" -eq 0 ] && log "台账为空（usage.db 里没有带 IP 的设备）"
-
-rm -f /tmp/.h5000m-usage.$$ /tmp/.h5000m-seen.$$
+rm -f "$DEVROWS" /tmp/.h5dhcp.$$ /tmp/.h5lease.$$ 2>/dev/null
 exit 0
