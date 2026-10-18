@@ -536,17 +536,24 @@ jobs:
           #   * OPENWRT_PINNED_REVISION is set (`--pinned`) → every run of that
           #     pin compiles the same kernel with the same config, so its
           #     vermagic is stable for the life of the pin.  Published next to
-          #     the pin in .abi (below) and reused.
+          #     the pin in kernel-abi.txt (below) and reused.
           #   * unpinned → the tree moves, so the ABI is not known until after
           #     the compile.  Nothing is guessed: the build falls back to the
           #     flat index and warns, and build_apk_repository() still files the
           #     packages under their real ABI directory for later use.
-          if [ -n "${OPENWRT_PINNED_REVISION:-}" ] && [ -s .abi ] &&
-             [ "$(sed -n '1p' .abi)" = "$OPENWRT_PINNED_REVISION" ]; then
-            export H5000M_KERNEL_ABI="$(sed -n '2p' .abi)"
+          #
+          # ★ kernel-abi.txt is NOT a dotfile on purpose.  The first version of
+          #   this used `.abi` and actions/upload-artifact silently skipped it
+          #   (`include-hidden-files` defaults to false), so the record was
+          #   written and then discarded — run 39023527785 published a correct
+          #   per-ABI repository while its image still pointed at the flat
+          #   index, because the file this step reads had never survived.
+          if [ -n "${OPENWRT_PINNED_REVISION:-}" ] && [ -s kernel-abi.txt ] &&
+             [ "$(sed -n '1p' kernel-abi.txt)" = "$OPENWRT_PINNED_REVISION" ]; then
+            export H5000M_KERNEL_ABI="$(sed -n '2p' kernel-abi.txt)"
             echo "kernel ABI for the pinned revision ${OPENWRT_PINNED_REVISION}: ${H5000M_KERNEL_ABI}"
           elif [ -n "${OPENWRT_PINNED_REVISION:-}" ]; then
-            echo "::warning::no .abi entry for the pinned revision ${OPENWRT_PINNED_REVISION}; this image will point at the un-ABI'd index until one is recorded"
+            echo "::warning::no kernel-abi.txt entry for the pinned revision ${OPENWRT_PINNED_REVISION}; this image will point at the un-ABI'd index until one is recorded"
           else
             echo "unpinned build: the kernel ABI is not knowable before the compile, so the package source stays flat"
           fi
@@ -1449,6 +1456,10 @@ jobs:
         if: success()
         run: |
           set -uo pipefail
+          # Explicit path, never a bare relative one: this is a plain file in the
+          # checkout root, and a later `cd` in another step must not be able to
+          # move it.  $GITHUB_WORKSPACE is the checkout for a normal job.
+          out="${GITHUB_WORKSPACE:-$PWD}/kernel-abi.txt"
           abi="$(sed -n 's/^kernel_abi=//p' artifacts/BUILD-INFO.txt | head -n1)"
           rev="$(sed -n 's/^openwrt_revision=//p' artifacts/BUILD-INFO.txt | head -n1)"
 
@@ -1467,17 +1478,24 @@ jobs:
             exit 0
           fi
 
-          printf '%s\n%s\n' "$pin" "$abi" >.abi
+          printf '%s\n%s\n' "$pin" "$abi" >"$out"
           echo "recorded: ${pin} -> ${abi}"
-          cat .abi
+          echo "written to: ${out}"
+          cat "$out"
 
       - name: Upload the ABI record
         if: success()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: kernel-abi
-          path: .abi
-          if-no-files-found: warn
+          # NOT a dotfile.  actions/upload-artifact defaults to
+          # `include-hidden-files: false`, so `.abi` uploaded as "No files were
+          # found" while the step above had just written it successfully —
+          # observed on run 39023527785, where the record was produced and
+          # silently discarded.  A visible name removes that whole class of
+          # mistake rather than switching a flag on.
+          path: kernel-abi.txt
+          if-no-files-found: error
           retention-days: 14
 
       - name: Publish release
