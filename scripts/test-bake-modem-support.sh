@@ -89,7 +89,14 @@ JSON
 }
 
 extra_seed() {
-	cat <<'JSON'
+	# EXTRA_SHAPE=comma 时每个 model 块以 `},` 结尾 —— 这是上游
+	# luci-app-qmodem-generic 从 2026-10-19 起的写法。合并脚本原先无条件给块尾
+	# 加逗号，遇到这种输入会产出 `},,`：只多一个字符，整份 modem_support.json
+	# 就再也读不出来，而报错是「第 41 行第 15 列不是合法属性名」，跟真正原因
+	# （块尾已经有逗号）毫无关系。两种形状都必须测。
+	local tail=""
+	[ "${EXTRA_SHAPE:-}" = "comma" ] && tail=","
+	cat <<JSON
 {
     "modem_support": {
         "usb": {
@@ -97,14 +104,14 @@ extra_seed() {
                 "manufacturer_id": "2c7c",
                 "manufacturer": "quectel",
                 "data_interface": "usb"
-            }
+            }${tail}
         },
         "pcie": {
             "rg520n-cn-pcie": {
                 "manufacturer_id": "2c7c",
                 "manufacturer": "quectel",
                 "data_interface": "pcie"
-            }
+            }${tail}
         }
     }
 }
@@ -250,6 +257,13 @@ echo
 echo "--- positive: a flat layout must work too (no fixed depth) ---"
 run_case flat present
 judge_merge "flat"
+
+# 2026-10-19 真事故的回归：上游把块尾写成 `},`，合并脚本又追加一个逗号 ⇒ `},,`。
+# 这条用例在修复前必然红（merged result is not valid JSON），修复后必须绿。
+echo
+echo "--- positive: upstream shape where each block already ends with a comma ---"
+EXTRA_SHAPE=comma run_case nested present
+judge_merge "nested/trailing-comma"
 
 echo
 echo "--- negative: the build must refuse, not silently no-op ---"
