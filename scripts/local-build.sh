@@ -2116,6 +2116,94 @@ stage_directory() {
 	fi
 }
 
+# Read the assembled rootfs back and insist the generated config is the one this
+# run produced.
+#
+# The image is built from build_dir/target-*/root-<board>, which sits on disk
+# after `make world` — so this reads the exact tree that gets flashed, without
+# unpacking anything, in milliseconds.
+#
+# The check exists because the failure it catches is invisible in the logs: the
+# script writes the files and prints their new values, then OpenWrt installs a
+# cached copy of the package and the image keeps the PREVIOUS build-id and the
+# PREVIOUS apk source URL.  Presence checks stay green, the upgrade page
+# compares against a build-id belonging to another commit, and ~180 minutes
+# plus one flash are spent on an image that is the old one under a new name.
+# Measured on 2026-10-20: the fe12b96 image said 8a4f740.
+verify_generated_config_landed() {
+	local want root got checked=0 id list
+
+	want="${GITHUB_SHA:-}"
+	[ -n "$want" ] || want="$(git -C "${ROOT_DIR}" rev-parse HEAD 2>/dev/null || true)"
+
+	shopt -s nullglob
+	for root in "${SRC}"/build_dir/target-*/root-*/etc/h5000m-build-id; do
+		checked=$((checked + 1))
+		id="${root%/etc/h5000m-build-id}"
+		got="$(sed -n 's/^commit=//p' "$root" | head -n1)"
+
+		if [ -n "$want" ] && [ "$got" != "$want" ]; then
+			die "the assembled rootfs (${id}) carries commit=${got:-<empty>} but this build is ${want} — the package was not reinstalled, so the image is the previous build. See purge_package_build_state."
+		fi
+
+		list="${id}/etc/apk/repositories.d/50-h5000m.list"
+		if [ -n "${H5000M_KERNEL_ABI:-}" ] && [ -f "$list" ]; then
+			if ! grep -q "/${H5000M_KERNEL_ABI}/packages.adb" "$list"; then
+				die "the assembled rootfs (${id}) points at the flat apk index, but kernel ABI ${H5000M_KERNEL_ABI} is known — the per-ABI URL never reached the image"
+			fi
+		fi
+	done
+	shopt -u nullglob
+
+	if [ "$checked" -eq 0 ]; then
+		warn "No assembled rootfs carried /etc/h5000m-build-id; the generated-config check did not run (build_dir layout changed?)"
+	else
+		log "Generated config verified against the assembled rootfs (${checked} tree(s), commit ${want:-unknown})"
+	fi
+
+	return 0
+}
+
+# Drop a package's build state so its next `install` step actually runs.
+#
+# OpenWrt builds a package once and then remembers it: `Build/Compile` and
+# `Package/*/install` are gated on stamp files that live inside the package's
+# PKG_BUILD_DIR.  CI restores build_dir from a cache (seed_cached_build_state)
+# and normalize_source_mtimes resets the source timestamps, so a package that
+# is staged AGAIN with different files/ looks untouched and is never
+# reinstalled.
+#
+# That is not theoretical.  The generated runtime config — /etc/h5000m-build-id,
+# /etc/h5000m-defaults.conf, /etc/apk/repositories.d/50-h5000m.list — is
+# rewritten on every run from build inputs.  The image built from fe12b96
+# carried a build-id saying 8a4f740 and the flat apk index URL, while the build
+# log at the same moment printed the per-ABI URL it had just written.  Every
+# assertion that only asked "does this file exist" stayed green; the image was
+# the previous build with a new name.  Cost: a full build and a wasted flash.
+#
+# h5000m-integration has an empty Build/Compile, so discarding its whole build
+# directory costs nothing.  Packages that actually compile are deliberately not
+# touched: for them the same failure reads "my patch is in the tree but not in
+# the image", and each one has to be judged on its own cost.
+purge_package_build_state() {
+	local name="$1" d
+
+	for d in "${SRC}"/build_dir/target-*/"${name}"; do
+		[ -d "$d" ] || continue
+		rm -rf "$d"
+		log "Dropped cached build state for ${name} so its files/ tree is reinstalled"
+	done
+
+	# The installed-package record and the packaged archive the image stage
+	# consumes.  Both spellings are matched because the tree still mixes them,
+	# and a stale archive here is copied into the image verbatim.
+	rm -rf "${SRC}"/staging_dir/target-*/pkginfo/"${name}".* 2>/dev/null || true
+	rm -f "${SRC}"/bin/targets/"${TARGET_BOARD}"/"${TARGET_SUBTARGET}"/packages/"${name}"-*.apk 2>/dev/null || true
+	rm -f "${SRC}"/bin/targets/"${TARGET_BOARD}"/"${TARGET_SUBTARGET}"/packages/"${name}"_*.ipk 2>/dev/null || true
+
+	return 0
+}
+
 install_local_packages() {
 	local pkg
 
@@ -2283,6 +2371,13 @@ EOF
 		printf 'commit=%s\n' "$build_commit"
 		printf 'built=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 	} >"${build_id}"
+
+	# Everything above only edits the staged files/ tree.  OpenWrt installs a
+	# package whose build stamp is gone, not one whose files changed, so say it
+	# out loud here — otherwise a cached build ships the previous run's
+	# build-id and apk source while the log claims the new ones (see
+	# purge_package_build_state).
+	purge_package_build_state h5000m-integration
 
 	return 0
 }
@@ -5078,6 +5173,8 @@ compile_firmware() {
 	wait "$heartbeat_pid" 2>/dev/null || true
 
 	log "Compilation finished in $((($(date +%s) - start) / 60)) min"
+
+	verify_generated_config_landed
 }
 
 # Say which package failed and why, from the logs make just wrote.
