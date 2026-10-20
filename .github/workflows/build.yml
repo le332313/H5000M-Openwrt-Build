@@ -96,6 +96,9 @@ concurrency:
 # file: a compromised action now gets a read-only token.
 permissions:
   contents: read
+  # kernel-abi.txt 只活在上一个 run 的 artifact 里，Build 之前要把它读回来
+  # （见 "Restore the kernel ABI record" 一步）。只读，不给写权限。
+  actions: read
 
 # Action majors are pinned deliberately: checkout v7 / upload-artifact v7 /
 # cache v6 are the first majors whose action.yml declares `using: node24`.  The
@@ -382,6 +385,40 @@ jobs:
           else
             echo "::warning::H5000M_SIGNING_KEY is not set, so this build signs the package index with a key of its own. Devices flashed from a different build will report an untrusted signature and refuse the repository."
           fi
+
+      # ★ kernel-abi.txt 只存在**上一个构建的 artifact** 里，而 artifact 不会
+      #   自己出现在新 run 的工作区。Build 那步用 `-s kernel-abi.txt` 决定
+      #   apk 源写成 <url>/<abi>/packages.adb 还是扁平 —— 少了这一步，记录
+      #   写了、传了，却永远没人读回来：10-20 run 39345957259 的日志原话就是
+      #   "no kernel-abi.txt entry for the pinned revision"，镜像于是仍指扁平
+      #   索引，而 ABI 分目录在仓库侧早就建好了。所谓「要再等一轮」的假象，
+      #   等的其实就是这一步不存在。
+      #
+      #   拿不到不算失败：首次 pinned 构建本来就没有记录，Build 会打 warning
+      #   并回退扁平（闸门 A 的 A16 会把「pinned 却是扁平」判红）。
+      - name: Restore the kernel ABI record from the previous build
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.pinned }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUILD_DIR: ${{ (github.event_name == 'workflow_dispatch' && inputs.runner_type == 'self-hosted') && github.workspace || '/o' }}
+        run: |
+          set -euo pipefail
+          cd "$BUILD_DIR"
+          aid="$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=kernel-abi&per_page=20" \
+                 --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | last | .id // empty' \
+                 2>/dev/null || true)"
+          if [ -z "${aid}" ]; then
+            echo "no kernel-abi artifact yet; the build falls back to the flat index and warns"
+            exit 0
+          fi
+          curl -fsSL --retry 3 \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${aid}/zip" \
+            -o /tmp/kernel-abi.zip
+          unzip -o -q /tmp/kernel-abi.zip -d .
+          echo "restored kernel-abi.txt (artifact ${aid}):"
+          sed -n '1,2p' kernel-abi.txt
 
       - name: Build
         # Build from $BUILD_DIR: /o (the short bind mount created above) on a
