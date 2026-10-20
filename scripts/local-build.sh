@@ -4258,6 +4258,15 @@ build_required_packages() {
 	is_true "$ENABLE_WWAND" && REQUIRED_PACKAGES+=(wwand wwand-qmi wwand-ncm wwand-mbim luci-app-wwand luci-proto-wwand)
 	is_true "$ENABLE_MT5700M" && REQUIRED_PACKAGES+=(luci-app-mt5700m ubus-at-daemon sms-tool_q)
 	is_true "$ENABLE_THEME_ARGON" && REQUIRED_PACKAGES+=(luci-theme-argon luci-app-argon-config)
+	# libffi: required, and nothing in the config would ever select it on its
+	# own.  python3 links Modules/_ctypes against it (--with-system-ffi) through
+	# a dependency declared by the packages feed, but the pinned tree predates
+	# the commit that moved libffi into the tree — see
+	# local-packages/libffi/Makefile for the full sequence.  Without the symbol
+	# in .config the build dies in python3 with `ffi.h: No such file or
+	# directory`, and only on a build that actually recompiles python3, which is
+	# why three cached builds in a row never noticed.
+	REQUIRED_PACKAGES+=(libffi)
 	# luci-compat: the store package is the lua-era layout (controller/store.lua,
 	# view/store/main.htm — verified live from the prebuilt package), and 25.12
 	# ships no lua runtime.  This mirrors linkease's own installer, which pulls
