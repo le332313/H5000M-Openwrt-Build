@@ -1,0 +1,24 @@
+#!/bin/sh
+# ★ 设备页流量链路的最后一环：higorosd 硬编码读 /tmp/usage.db（wrtbwmon 数据库）。
+# 两处坑都在这里堵：
+#
+#   ① 路径错位：wrtbwmon 默认配置把 db 写到 /etc/usage.db（overlay，每 5 秒重写
+#      一遍还磨损闪存），higorosd 在 /tmp 找不到文件 ⇒ 设备页流量恒 0。
+#      10-20 实测：/etc/usage.db 一直在正常累加（mtime 每 5 秒跳），
+#      而 state 里 todayMb 恒 0 —— 就是这个错位。
+#
+#   ② 启动竞态：higorosd START=95，wrtbwmon START=99，higorosd 的流量循环对
+#      「文件不存在」零容忍 —— 第一个读取周期看不到文件，循环就停摆，
+#      连 dayKey 跨日清零都不再执行（10-20 实测 dayKey 停在昨天、state 的
+#      mtime 冻结在开机时刻）。tmpfs 每次开机都是空的，必须垫一个只有表头的库。
+#      wrtbwmon 起来后会用真实数据整体重写，垫底文件只保证「第一个读取周期看得见」。
+[ -f /etc/config/wrtbwmon ] || : > /etc/config/wrtbwmon
+uci -q set wrtbwmon.general=wrtbwmon
+uci set wrtbwmon.general.enabled='1'
+uci set wrtbwmon.general.path='/tmp/usage.db'
+uci set wrtbwmon.general.interval='5'
+uci commit wrtbwmon
+if [ ! -s /tmp/usage.db ]; then
+  printf '#mac,ip,iface,speed_in,speed_out,in,out,total,first_date,last_date\n' > /tmp/usage.db
+fi
+exit 0

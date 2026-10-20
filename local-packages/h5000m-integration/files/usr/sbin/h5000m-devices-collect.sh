@@ -64,7 +64,11 @@
 CACHE=/tmp/higoros-devices-cache.json
 CACHE_ETC=/etc/higoros/higoros-devices-cache.json
 STATE=/tmp/higoros-devices-state.json
-DB=/etc/usage.db
+# wrtbwmon 的 db 由 93-h5000m-wrtbwmon 钉在 /tmp/usage.db（higorosd 硬编码路径）。
+# /tmp/usage.db 是活数据；/etc/usage.db 是 10-20 之前错位配置留下的旧账，
+# 只在 /tmp 那份缺失时才兜底读它。
+DB=/tmp/usage.db
+[ -s "$DB" ] || DB=/etc/usage.db
 # ★★ 台账绝不能放在 /etc/higoros/ 下：higorosd 会遍历那个目录，把每个文件
 #   的每一行都当成一台设备读进去，污染 ranking 与 state。
 TSV=/etc/h5000m/devices-traffic.tsv
