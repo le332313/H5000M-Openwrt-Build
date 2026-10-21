@@ -328,6 +328,33 @@ configure_guard() {
 	return 0
 }
 
+# ------------------------------------------- higorosd traffic loop watchdog ---
+# 2026-10-21 实机：把 wrtbwmon 的库钉到 /tmp/usage.db 之后，流量列在手工重启
+# higorosd 后正常，但**开机后大概率不动**（5 次开机里 4 次 state 的 mtime
+# 冻结在开机后几秒，todayMb 恒 0，而 /tmp/usage.db 仍在每 5 秒累加）。
+# 手工 restart 之后 6 次全部正常，且 todayMb 立刻按库里的累计值算出来 —— 不丢数据。
+# 根因在二进制内部（无日志可读），已排除的假设见 /usr/sbin/h5000m-higoros-guard.sh 头注释。
+#
+# 同一个 cron 安装约定：只追加自己那一行，绝不动别人的行。
+configure_higoros_guard() {
+	[ -x /usr/sbin/h5000m-higoros-guard.sh ] || return 1
+
+	local ct='/etc/crontabs/root'
+	mkdir -p /etc/crontabs 2>/dev/null
+	[ -f "$ct" ] || : >"$ct"
+
+	if ! grep -qE '^[[:space:]]*[^#[:space:]].*h5000m-higoros-guard\.sh' "$ct" 2>/dev/null; then
+		printf '* * * * * /usr/sbin/h5000m-higoros-guard.sh\n' >>"$ct"
+		chmod 0600 "$ct" 2>/dev/null
+		log "higoros guard: cron entry installed"
+		/etc/init.d/cron enable >/dev/null 2>&1
+		/etc/init.d/cron restart >/dev/null 2>&1
+	fi
+
+	/etc/init.d/cron enabled >/dev/null 2>&1 || /etc/init.d/cron enable >/dev/null 2>&1
+	return 0
+}
+
 # ------------------------------------------------ device ledger collector ---
 # The HigoOS "devices" page does not sample anything itself: it renders
 # /api/v1/devices, which is a plain read of /tmp/higoros-devices-cache.json
@@ -397,6 +424,7 @@ main() {
 	configure_timezone
 	configure_worker_interval
 	configure_guard
+	configure_higoros_guard
 	configure_devices
 
 	return 0
