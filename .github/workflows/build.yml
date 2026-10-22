@@ -299,12 +299,31 @@ jobs:
           IMAGE: ghcr.io/${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_ACTOR: ${{ github.actor }}
+          # COLD_BUILD is a repository variable, not a dispatch input: the input
+          # list is already at GitHub's ceiling of ten.  `true` skips the
+          # restore, so every package is compiled from source.
+          COLD_BUILD: ${{ vars.COLD_BUILD || 'false' }}
         run: |
           set -euo pipefail
           image="$(echo "${IMAGE}" | tr '[:upper:]' '[:lower:]')/buildcache"
           tag="$(sha256sum configs/h5000m.config feeds.conf.default | sha256sum | cut -c1-16)"
           echo "image=${image}" >> "$GITHUB_OUTPUT"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+          # A cache-restored build is not proof that the tree is self-consistent:
+          # a stale build_dir carries .built stamps that hide a missing
+          # dependency, which is exactly how libffi went unnoticed on 2026-10-20
+          # (python3 was never recompiled, so `ffi.h: No such file` only appeared
+          # on a cold tree).  Skipping the restore is the only way to tell the
+          # difference.  The save step below still runs under the same tag, so a
+          # successful cold build replaces the cached baseline — that is the
+          # intent, not a side effect.
+          if [ "${COLD_BUILD:-false}" = "true" ]; then
+            echo "COLD_BUILD=true — 跳过构建缓存恢复，本轮全量编译"
+            rm -rf .buildcache
+            mkdir -p .buildcache
+            exit 0
+          fi
 
           # `github.actor` is a login name, but it reaches the shell only via
           # the environment: interpolating it here would be template injection
