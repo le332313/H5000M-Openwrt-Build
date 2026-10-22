@@ -399,6 +399,62 @@ configure_devices() {
 	return 0
 }
 
+# --------------------------------------------------------- SMS alignment ---
+# 2026-10-22 实机：设备上有两套短信栈。qmodem-smsd 把短信写进
+# /etc/qmodem/sms.sqlite3 并从 SIM 删掉（auto_delete），而 HigoOS(higorosd)
+# 只认自己的 /etc/qmodem/2_1_received.json —— 结果海狗短信页从 10/14 原厂
+# 固件之后就没再新增过（库里 9 条，海狗只有 1 条）。
+#
+# 实测出的两条硬约束：
+#   1. higorosd 只在启动时读一次该文件；
+#   2. 每次 ubus 调 qmodem_sms list_sms 它都用内存内容把文件覆写回去。
+# 所以「改文件不重启」等于白改，对齐脚本必须带一次 restart（限频 120s）。
+configure_sms_align() {
+	[ -x /usr/sbin/h5000m-sms-align.sh ] || return 1
+
+	local ct='/etc/crontabs/root'
+	mkdir -p /etc/crontabs 2>/dev/null
+	[ -f "$ct" ] || : >"$ct"
+
+	if ! grep -qE '^[[:space:]]*[^#[:space:]].*h5000m-sms-align\.sh' "$ct" 2>/dev/null; then
+		printf '*/2 * * * * /usr/sbin/h5000m-sms-align.sh\n' >>"$ct"
+		chmod 0600 "$ct" 2>/dev/null
+		log "sms align: cron entry installed"
+		/etc/init.d/cron enable >/dev/null 2>&1
+		/etc/init.d/cron restart >/dev/null 2>&1
+	fi
+
+	/etc/init.d/cron enabled >/dev/null 2>&1 || /etc/init.d/cron enable >/dev/null 2>&1
+
+	# 开机先把历史补上，别等两分钟——用户开机第一件事就是看这个页面。
+	/usr/sbin/h5000m-sms-align.sh >/dev/null 2>&1 &
+
+	return 0
+}
+
+# ------------------------------------------------------- metrics rotation ---
+# /tmp/higoros/resource-metrics-db.json 与 cpe-speed-history.json 都不滚动：
+# 实测 5 秒一条、18 小时 1.9 MB（≈75 MB/月），而 /tmp 是 492 MB 的 tmpfs。
+# 不裁剪的话跑几个月会把 tmpfs 吃满，之后 higorosd 写失败又是一类「面板不动」。
+configure_metrics_rotate() {
+	[ -x /usr/sbin/h5000m-metrics-rotate.sh ] || return 1
+
+	local ct='/etc/crontabs/root'
+	mkdir -p /etc/crontabs 2>/dev/null
+	[ -f "$ct" ] || : >"$ct"
+
+	if ! grep -qE '^[[:space:]]*[^#[:space:]].*h5000m-metrics-rotate\.sh' "$ct" 2>/dev/null; then
+		printf '17 * * * * /usr/sbin/h5000m-metrics-rotate.sh\n' >>"$ct"
+		chmod 0600 "$ct" 2>/dev/null
+		log "metrics rotate: cron entry installed"
+		/etc/init.d/cron enable >/dev/null 2>&1
+		/etc/init.d/cron restart >/dev/null 2>&1
+	fi
+
+	/etc/init.d/cron enabled >/dev/null 2>&1 || /etc/init.d/cron enable >/dev/null 2>&1
+	return 0
+}
+
 main() {
 	# Each default is applied once, independently, and only after it actually
 	# took effect.  Re-running is safe either way — the guards inside make both
@@ -426,6 +482,8 @@ main() {
 	configure_guard
 	configure_higoros_guard
 	configure_devices
+	configure_sms_align
+	configure_metrics_rotate
 
 	return 0
 }
