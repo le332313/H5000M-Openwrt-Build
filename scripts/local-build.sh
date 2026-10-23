@@ -1140,6 +1140,11 @@ prepare_feeds() {
 	# revision rather than the branch head.  See FEEDS_SNAPSHOT_DATE.
 	pin_all_feeds
 
+	# After pin_all_feeds, because that is what resets the checkouts, and before
+	# `feeds install` / the package prepare step, because the patches have to be
+	# sitting in feeds/<feed>/<pkg>/patches/ when the package is unpacked.
+	apply_feed_patches
+
 	log "Installing feeds"
 	run_with_timeout "$FEEDS_TIMEOUT" ./scripts/feeds install -a ||
 		die "feeds install failed"
@@ -1273,6 +1278,70 @@ pin_all_feeds() {
 # build that is meant to track the feed upstream should do.  A non-empty value
 # is a reproduction knob: the run is then a function of a fixed feed, so a
 # package drop can only come from the tree.
+# Backport the fixes upstream landed *after* the feed snapshot date.
+#
+# Why this is needed: pin_all_feeds() rolls every feed back to the commit that
+# was current at the tree's commit time, so a fix pushed to a feed a few days
+# later is invisible here even though the branch head already carries it.
+# The 2026-10-22 cold build hit exactly that: libacl 2.4.0 (2026-06-29) started
+# exporting acl_get_file_at()/acl_set_file_at()/acl_delete_def_file_at(), while
+# GNU tar 1.35 declares its own three-argument wrappers with those very names,
+# so src/xattrs.c stopped compiling with "conflicting types".  openwrt/packages
+# fixed it on 2026-10-21 (baba60db, carrying GNU tar 08c3fc2e); the pin here is
+# 2026-10-16, so the patch is carried in feeds-patches/ until the pin moves past
+# that date.  Delete the directory entry (and this function, if it empties) when
+# OPENWRT_PINNED_REVISION is newer than 2026-10-21.
+#
+# Layout: feeds-patches/<feed>/<path inside feed>/<pkg>/<name>.patch
+#   e.g. feeds-patches/packages/utils/tar/100-....patch
+#       -> feeds/packages/utils/tar/patches/100-....patch
+#
+# If the feed's own patches/ directory already mentions the same upstream
+# commit, the feed has caught up and our copy is skipped rather than applied
+# twice.
+apply_feed_patches() {
+	local patch rel name pkg_dir dst upstream n=0
+
+	for patch in "${ROOT_DIR}"/feeds-patches/*/*/*/*.patch; do
+		[ -f "$patch" ] || continue
+
+		rel="${patch#"${ROOT_DIR}"/feeds-patches/}"
+		rel="${rel%/*}"
+		name="${patch##*/}"
+		pkg_dir="${SRC}/feeds/${rel}"
+
+		if [ ! -d "$pkg_dir" ]; then
+			warn "feed patch ${name}: feeds/${rel} does not exist - skipped"
+			continue
+		fi
+
+		# Same upstream commit already present? Then the feed is ahead of us.
+		# --exclude our own file name, or a second run would mistake the copy we
+		# installed last time for upstream's and report it as such.
+		upstream="$(sed -n 's/.*[?&]id=\([0-9a-f]\{7,40\}\).*/\1/p' "$patch" | head -1)"
+		if [ -n "$upstream" ] && [ -d "${pkg_dir}/patches" ] &&
+			grep -rqs --exclude="$name" "$upstream" "${pkg_dir}/patches"; then
+			log "feed patch ${name}: already upstream in feeds/${rel} - skipped"
+			continue
+		fi
+
+		dst="${pkg_dir}/patches/${name}"
+		if [ -f "$dst" ]; then
+			log "feed patch ${name}: already in place"
+			continue
+		fi
+
+		mkdir -p "${pkg_dir}/patches"
+		cp "$patch" "$dst" ||
+			die "could not install feed patch ${name} into feeds/${rel}"
+		log "feed patch ${name} -> feeds/${rel}/patches/"
+		n=$((n + 1))
+	done
+
+	[ "$n" -gt 0 ] && log "installed ${n} local feed patch(es)"
+	return 0
+}
+
 pin_qmodem_feed() {
 	is_true "$ENABLE_QMODEM" || return 0
 	[ -n "$QMODEM_PINNED_REVISION" ] || return 0
