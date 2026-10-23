@@ -109,7 +109,16 @@ while :; do
 	done
 	[ -n "$run_id" ] || die "no run appeared after the dispatch"
 
-	run_sha="$(gh run view "$run_id" -R "$REPO" --json headSha --jq '.headSha' 2>/dev/null || true)"
+	# 读 head_sha 只用 api，不用 `gh run view --json`：后者在本机（Windows）
+	# 参数会被拼坏，返回空串。空串不代表 raced —— 2026-10-23 就是这样把一个
+	# 正确答案（39927901131，head=b8479457）判成"raced"，取消又没生效，于是
+	# 多起了一个重复的冷构建（39927954541），白烧一份 4 小时算力 + 一份缓存。
+	run_sha=""
+	for _ in $(seq 1 10); do
+		run_sha="$(gh api "repos/${REPO}/actions/runs/${run_id}" -q '.head_sha' 2>/dev/null || true)"
+		[ -n "$run_sha" ] && break
+		sleep 2
+	done
 
 	if [ "$run_sha" = "$want" ]; then
 		log "run ${run_id} is building ${want:0:8} - correct"
@@ -117,11 +126,27 @@ while :; do
 		exit 0
 	fi
 
+	# 读不到就问人，不要猜。猜错的代价是一个重复的 4 小时构建。
+	if [ -z "$run_sha" ]; then
+		die "run ${run_id} exists but its head_sha could not be read - check it by hand: https://github.com/${REPO}/actions/runs/${run_id}"
+	fi
+
 	# Wrong commit: the dispatch raced the push.  Cancel it rather than pay
 	# ten minutes for a verdict about the previous revision.
 	warn "run ${run_id} resolved to ${run_sha:0:8}, wanted ${want:0:8} - the dispatch raced the push"
-	gh run cancel "$run_id" -R "$REPO" >/dev/null 2>&1 ||
+	if ! gh run cancel "$run_id" -R "$REPO" >/dev/null 2>&1; then
 		warn "could not cancel run ${run_id}; cancel it by hand"
+	fi
+
+	# 取消是异步的：没落地就重试，等于同时跑两份。确认它真的不再 in_progress。
+	for _ in $(seq 1 10); do
+		st="$(gh api "repos/${REPO}/actions/runs/${run_id}" -q '.status' 2>/dev/null || true)"
+		[ "$st" != "in_progress" ] && [ "$st" != "queued" ] && break
+		sleep 2
+	done
+	if [ "$st" = "in_progress" ] || [ "$st" = "queued" ]; then
+		die "run ${run_id} is still ${st} after cancel - refusing to start a duplicate; cancel it by hand first"
+	fi
 
 	attempt=$((attempt + 1))
 	[ "$attempt" -le "$ATTEMPTS" ] ||
