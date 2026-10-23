@@ -1551,7 +1551,13 @@ jobs:
           # silently discarded.  A visible name removes that whole class of
           # mistake rather than switching a flag on.
           path: kernel-abi.txt
-          if-no-files-found: error
+          # 这一步写不写文件，取决于「本轮编译的 revision 是否等于钉版」：
+          # latest 轨道编的是上游 HEAD，记录下来就是一条假陈述，所以
+          # "Record the kernel ABI" 会 exit 0 且不写文件。原来这里写 error，
+          # 于是 run 39888666509（latest，固件 89 MB 已构建、已上传、已签名）
+          # 在最后一步被判红 —— 固件是好的，红的只是一个本该允许缺失的 artifact。
+          # 缺失不是异常：首次 pinned 构建同样没有记录，Build 会打 warning 并回退扁平索引。
+          if-no-files-found: ignore
           retention-days: 14
 
       - name: Publish release
