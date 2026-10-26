@@ -148,24 +148,36 @@ define Package/h5000m-integration/install
 	# Copy the whole files/ tree rather than naming each file.  Naming them is
 	# how the first-boot defaults ended up committed but never installed: the
 	# Makefile listed three files and silently ignored the four new ones.
-	# $(CP) preserves the source modes, so scripts stay 0755 and
-	# /etc/h5000m-defaults.conf stays 0600 (it holds the WiFi key, and
-	# scripts/local-build.sh chmods it when generating).
+	#
+	# ★ 2026-10-19 更正：这里原来写着「$(CP) preserves the source modes, so
+	# scripts stay 0755」，那句话是错的。$(CP) 保留的是**源文件**权限，而源权限
+	# 在 CI 上完全由 git 索引决定 —— Windows checkout 不体现权限，`ls -l` 看着
+	# 是 755 也没用。h5000m-devices-collect.sh 的索引记录是 100644，于是
+	# CI 拿到 644、装进镜像 644，设备上 cron 每分钟 Permission denied：
+	# 文件在、md5 对、闸门全绿，而 v4 巡检能力实际为零，刷机后两天没人发现。
+	# 所以显式 chmod，让结果不再取决于谁在哪个操作系统上提交。
 	#
 	# Layout, all under files/:
 	#   usr/sbin/h5000m-wwan-provision          wwand interface provisioning
 	#   usr/sbin/h5000m-firstboot               WiFi + flow-offload defaults
+	#   usr/sbin/h5000m-devices-collect.sh      device-page cache health check
 	#   etc/uci-defaults/91-h5000m-wwan         first boot: provision the modem
 	#   etc/uci-defaults/92-h5000m-defaults     first boot: WiFi + offload
 	#   etc/hotplug.d/usb/50-h5000m-wwan        modem enumerated later
 	#   etc/hotplug.d/ieee80211/20-h5000m-defaults  radio appeared (after
 	#                                          10-wifi-detect, which is what
 	#                                          creates /etc/config/wireless)
+	#   etc/higoros/higoros-devices-cache.json  boot seed for the device page,
+	#                                          deliberately empty (see keep.d)
 	#   lib/upgrade/keep.d/h5000m-defaults      preserve the applied marker
 	#   etc/h5000m-defaults.conf                generated at build time
 	#   etc/apk/repositories.d/50-h5000m.list   generated when a repo URL is set
 	$(INSTALL_DIR) $(1)
 	$(CP) ./files/* $(1)/
+	chmod 0755 $(1)/usr/sbin/h5000m-*
+	chmod 0755 $(1)/etc/uci-defaults/9?-h5000m-*
+	chmod 0755 $(1)/etc/hotplug.d/usb/50-h5000m-*
+	chmod 0755 $(1)/etc/hotplug.d/ieee80211/20-h5000m-*
 endef
 
 $(eval $(call BuildPackage,h5000m-integration))

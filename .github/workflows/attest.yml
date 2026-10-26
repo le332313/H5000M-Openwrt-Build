@@ -68,9 +68,28 @@ jobs:
           # The index is small; fetch it plus the packages that make up the
           # repository listing.  Attesting the INDEX is the point: it is the
           # signed artefact every device trusts.
+          #
+          # The index lives at <abi>/packages.adb.  The ABI is discoverable from
+          # the site root: publish-apk-repo writes abi.txt there naming the
+          # directory this build published.  Falling back to the flat legacy
+          # path keeps this working against a site published before that file
+          # existed, which is the state the very first run after this change
+          # finds itself in.
           mkdir -p apk-repo
           base="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}"
-          curl -fsSL --retry 3 -o apk-repo/packages.adb "${base}/packages.adb"
+          abi="$(curl -fsSL --retry 3 "${base}/abi.txt" 2>/dev/null | head -n1 || true)"
+          case "$abi" in
+            "" | *[!0-9a-f]*)
+              echo "::warning::no ABI recorded at ${base}/abi.txt; attesting the flat index"
+              abi=""
+              ;;
+          esac
+          if [ -z "$abi" ]; then
+            curl -fsSL --retry 3 -o apk-repo/packages.adb "${base}/packages.adb"
+          else
+            curl -fsSL --retry 3 -o apk-repo/packages.adb "${base}/${abi}/packages.adb"
+            echo "attesting the index for kernel ABI ${abi}"
+          fi
 
       - name: Generate an SBOM for the repository index
         run: |

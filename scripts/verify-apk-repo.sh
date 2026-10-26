@@ -71,8 +71,35 @@ else
 fi
 
 if [ -z "$TARGET" ]; then
-	if [ -s "${ROOT_DIR}/artifacts/apk-repo/packages.adb" ]; then
-		TARGET="${ROOT_DIR}/artifacts/apk-repo/packages.adb"
+	# The built repository is laid out one directory per kernel ABI, so the
+	# index is not at a fixed path.  Prefer a caller-supplied ABI, then the one
+	# BUILD-INFO.txt records for this build, then the newest directory — taking
+	# "newest" only as a last resort, because a stale ABI directory from an
+	# earlier build must not shadow the one just produced.
+	REPO_DIR="${ROOT_DIR}/artifacts/apk-repo"
+	ABI="${H5000M_KERNEL_ABI:-}"
+	if [ -z "$ABI" ] && [ -f "${ROOT_DIR}/artifacts/BUILD-INFO.txt" ]; then
+		ABI="$(sed -n 's/^kernel_abi=//p' "${ROOT_DIR}/artifacts/BUILD-INFO.txt" | head -n1)"
+	fi
+	if [ -z "$ABI" ] && [ -d "$REPO_DIR" ]; then
+		# `-newer $REPO_DIR/public-key.pem` would be nicer, but the key is only
+		# written when one exists; newest-first on the index itself is enough
+		# to pick the build that just ran.
+		ABI="$(find "$REPO_DIR" -mindepth 1 -maxdepth 1 -type d ! -name firmware 2>/dev/null |
+			while read -r d; do
+				[ -f "${d}/packages.adb" ] && printf '%s\n' "$d"
+			done |
+			xargs -r ls -dt 2>/dev/null | head -n1 | xargs -r basename)"
+	fi
+
+	if [ -n "$ABI" ] && [ -s "${REPO_DIR}/${ABI}/packages.adb" ]; then
+		TARGET="${REPO_DIR}/${ABI}/packages.adb"
+	elif [ -s "${REPO_DIR}/packages.adb" ]; then
+		# The flat layout: an older build, or a build that could not determine
+		# its own ABI.  Reading it is still useful — it is what devices flashed
+		# from that build actually use.
+		TARGET="${REPO_DIR}/packages.adb"
+		echo "note: no per-ABI index found; checking the flat legacy repository" >&2
 	else
 		TARGET="https://existyay.github.io/AutoBuild-H5000M-Openwrt/packages.adb"
 		echo "note: no local build found; checking the published repository" >&2

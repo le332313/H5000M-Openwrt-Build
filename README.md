@@ -116,10 +116,12 @@ H5000M 的 U-Boot 自带 failsafe，上传 initramfs 镜像后系统在内存里
 | 面板分工 | `:80` = HigoOS 面板 · `:8080` / `:8443` = 传统 LuCI |
 | 主机名 | `Hiveton H5000M` |
 | DHCP 池 | `.100 ~ .249`，租期 12h |
-| Wi-Fi | SSID `openwrt`，**无密码（开放网络）** |
+| Wi-Fi | 2.4G `Higoros-H5000M-2.4G` · 5G `Higoros-H5000M-5G` |
+| Wi-Fi 加密 | **WPA2/WPA3 混合（`sae-mixed`）**，密码 `H987654321` |
 | 国家码 | `CN` |
 
-> **默认是开放网络，连上后请立刻设密码**（HigoOS 面板或 LuCI 里都可以改）。
+> **两个频段分开命名**：一眼就能看出客户端挂在哪个频段（"网速慢"通常是设备停在 2.4G）。
+> 密码也是构建默认值（`H5000M_WIFI_KEY`）——**拿到设备请先改掉**。
 > 首启脚本只写一次，之后不会覆盖你改过的设置。
 
 ---
@@ -251,8 +253,9 @@ gh workflow run build.yml --ref higoros-qmodem
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `H5000M_WIFI_SSID` | `openwrt` | 首启 SSID |
-| `H5000M_WIFI_KEY` / `_ENCRYPTION` | 空 / `none` | 默认开放网络 |
+| `H5000M_WIFI_SSID` | `Higoros-H5000M` | 首启 SSID **基名**；两个频段名由它派生 |
+| `H5000M_WIFI_SSID_2G` / `_5G` | `<基名>-2.4G` / `<基名>-5G` | 两个频段各自的 SSID；设成同一个值即回到"单名" |
+| `H5000M_WIFI_KEY` / `_ENCRYPTION` | `H987654321` / `sae-mixed` | WPA2/WPA3 混合；`_ENCRYPTION=none` + 空 `_KEY` 即回到开放网络 |
 | `H5000M_APK_REPO_URL` | 空 | 软件源基址；留空则固件不带额外源 |
 | `ENABLE_QMODEM` / `ENABLE_OAF` / `ENABLE_HIGOROS` | 在线构建固定开 | 5G 栈 / 应用过滤 / 海狗保真层 |
 | `ENABLE_PASSWALL` / `ENABLE_PASSWALL2` | `true` | 编进软件源（`=m`），不占镜像体积 |
@@ -276,10 +279,15 @@ H5000M_APK_REPO_URL=http://<你的地址>:8099 ./scripts/local-build.sh
 确认某个固件对应的源能不能装，用设备自己的 apk 逻辑查一遍：
 
 ```sh
-./scripts/verify-apk-repo.sh                       # 查刚编译出的 artifacts/apk-repo/
+./scripts/verify-apk-repo.sh                       # 查刚编译出的 artifacts/apk-repo/<abi>/
 ./scripts/verify-apk-repo.sh --with-official-feeds # 再加上官方源，等价于实机环境
-./scripts/verify-apk-repo.sh https://<地址>/packages.adb   # 查已发布的源
+./scripts/verify-apk-repo.sh https://<地址>/<abi>/packages.adb   # 查已发布的源
 ```
+
+仓库按内核 ABI 分目录：每个 ABI 一个目录、一个索引（`<abi>/packages.adb`），这样重新构建
+不会覆盖上一个内核的索引。脚本会自己从 `artifacts/BUILD-INFO.txt` 的 `kernel_abi=` 找出
+本轮那个 `<abi>`；也可以 `H5000M_KERNEL_ABI=<abi>` 直接指定。站点根的 `packages.adb`
+是给尚未刷写新固件的设备留的兼容副本。
 
 它只配置指定的源，用构建出的 `apk` 建临时数据库，逐条断言 15 个面板、12 个核与守护进程、20 个 kmod、12 个中文语言包都在，`sing-box` 是钉住的 1.12.25，以及**每个面板都能解析出它需要的核**。
 

@@ -311,19 +311,64 @@ declare -A EMITTED_IMAGE=()
 #
 # WiFi: a freshly flashed OpenWrt leaves every radio disabled until someone logs
 # in and picks a country, which reads as "WiFi does not work" on a 5G CPE.  The
-# defaults below turn both radios on with one shared SSID.  CHANGE THE KEY
-# before flashing anything you care about.
-H5000M_WIFI_SSID="${H5000M_WIFI_SSID:-openwrt}"
-# No password by default.  Encryption is `none` and there is no key, so the
-# first boot brings up an open network: a fresh device is reachable without
-# anyone having to know a credential that is printed nowhere.  Owners are
-# expected to set their own; the first-boot script never overwrites an SSID that
-# has already been changed.
-H5000M_WIFI_KEY="${H5000M_WIFI_KEY:-}"
+# defaults below turn both radios on with a documented name, key and country.
+#
+# The two radios get DIFFERENT names by default.  A shared SSID hides which band
+# a client is on, and "WiFi is slow" is nearly always a client parked on 2.4 GHz
+# (40 MHz of a congested band) while the 5 GHz radio sits idle.  Distinct names
+# make that visible in one glance at the client, and let IoT gear be pinned to
+# 2.4 GHz on purpose.  H5000M_WIFI_SSID is the base the two per-band names are
+# derived from; set the per-band variables to override either one directly, or
+# set all three to the same string to get a single shared name back.
+H5000M_WIFI_SSID="${H5000M_WIFI_SSID:-Higoros-H5000M}"
+H5000M_WIFI_SSID_2G="${H5000M_WIFI_SSID_2G:-${H5000M_WIFI_SSID}-2.4G}"
+H5000M_WIFI_SSID_5G="${H5000M_WIFI_SSID_5G:-${H5000M_WIFI_SSID}-5G}"
+# The network is encrypted.  The earlier default was an open network
+# (encryption=none, no key) justified by "a fresh device is reachable without
+# anyone knowing a credential" — true, but it also meant every unit shipped a
+# wide-open AP, and the key that was "printed nowhere" was also in no backup.
+# sae-mixed is the WPA2/WPA3 transitional mode: WPA3-SAE for clients that speak
+# it, WPA2-PSK for everything older, so no client is locked out.  The hostapd in
+# this image is wpad-basic-mbedtls, which carries SAE; the first-boot script
+# pairs the key with ieee80211w=1 (PMF optional), which sae-mixed requires.
+# The first-boot script never overwrites an SSID the owner has already changed.
+H5000M_WIFI_KEY="${H5000M_WIFI_KEY:-H987654321}"
 H5000M_WIFI_COUNTRY="${H5000M_WIFI_COUNTRY:-CN}"
-H5000M_WIFI_ENCRYPTION="${H5000M_WIFI_ENCRYPTION:-none}"
-H5000M_WIFI_HTMODE_2G="${H5000M_WIFI_HTMODE_2G:-EHT40}"
-H5000M_WIFI_HTMODE_5G="${H5000M_WIFI_HTMODE_5G:-EHT160}"
+H5000M_WIFI_ENCRYPTION="${H5000M_WIFI_ENCRYPTION:-sae-mixed}"
+H5000M_WIFI_HTMODE_2G="${H5000M_WIFI_HTMODE_2G:-EHT20}"
+H5000M_WIFI_HTMODE_5G="${H5000M_WIFI_HTMODE_5G:-EHT80}"
+# Both defaults used to be the widest the chip can do (EHT40 / EHT160), which is
+# the wrong trade on a real site rather than in a datasheet:
+#
+#   2.4 GHz has three non-overlapping channels (1/6/11), so EHT40 there ALWAYS
+#   overlaps a neighbour — it measures slower than 20 MHz wherever there is one,
+#   while raising retries for everyone around.  EHT20 is the honest setting.
+#
+#   5 GHz in CN is 36-64 plus 149-165, and 52-64 are DFS.  EHT160 out of 36
+#   necessarily spans 36-64, so the AP has to pass radar detection before it
+#   comes up and has to move channel if radar appears: "5 GHz missing for a
+#   while" and then "5 GHz dropped".  5.8 GHz is not contiguous, so 160 MHz
+#   cannot be had there instead.  EHT80 at 36 spans 36-48, all non-DFS — up
+#   immediately and never evicted.
+#
+# The EHT prefix is mandatory on this WiFi 7 target.  wifi-scripts rejects a
+# bare "HT80" outright, and a rejected htmode takes the entire radio down rather
+# than silently narrowing it (measured on the device: the 5 GHz AP vanished).
+#
+# These are defaults for a FRESH flash only — the first-boot script never
+# rewrites a radio whose SSID the owner has already changed.
+
+# qmodem-worker polling interval, in seconds.  This is the knob that sets how
+# fast rpcd leaks on this board.  rpcd never frees the output buffer of an
+# external-script ubus method, and qmodem is exactly such a method, so every call
+# leaks heap — and qmodem-worker is the source of ~98% of all qmodem calls
+# (measured by freezing it: qmodem invocations fell from 102 to 2 per 30 s).
+# At the upstream default of 15 s that is 370-524 kB/min ≈ 750 MB/day, which had
+# accumulated to 619 MB and taken `available` down to 18 MB with load 21.
+#
+# 60 s cuts the leak to roughly a quarter.  The worker's own cache TTL is 90 s,
+# so 60 s still refreshes well before a reading is treated as stale.
+H5000M_QMODEM_WORKER_INTERVAL="${H5000M_QMODEM_WORKER_INTERVAL:-60}"
 
 # Hardware acceleration.  On mainline this is the netfilter flowtable offload
 # driving the MTK PPE — the same hardware the vendor's TurboACC/hnat panel
@@ -348,6 +393,20 @@ H5000M_FLOW_OFFLOAD_HW="${H5000M_FLOW_OFFLOAD_HW:-1}"
 # scripts/serve-apk-repo.sh serves artifacts/apk-repo/ over HTTP and prints the
 # exact value to build with, which is the quickest way to a working setup.
 H5000M_APK_REPO_URL="${H5000M_APK_REPO_URL:-}"
+
+# The kernel ABI this build will produce, so the source entry above can name a
+# per-ABI directory instead of one index that the next build overwrites.
+#
+# It has to be supplied BEFORE the build, because 50-h5000m.list is written into
+# the image at configuration time — long before profiles.json exists.  CI passes
+# the value it recorded for the pinned revision (see .abi in build.yml); a local
+# build can pass it by hand, or omit it and accept the flat fallback.
+#
+# Never derived from an already-built profiles.json: that file, if present at
+# all, belongs to a PREVIOUS build, and pointing the image at another kernel's
+# directory is worse than pointing at none.  Empty means "unknown", and
+# kernel_abi() says so rather than guessing.
+H5000M_KERNEL_ABI="${H5000M_KERNEL_ABI:-}"
 
 # --------------------------------------------------------------------- UI ----
 # Argon is the theme the H5000M builds in the wild use, and it is not in any
@@ -688,14 +747,17 @@ show_features() {
 	log "Target        : ${TARGET_BOARD}/${TARGET_SUBTARGET} profile=${TARGET_PROFILE}"
 	log "Board stack   : fancontrol=${ENABLE_FANCONTROL} netmode=${ENABLE_NETMODE} wwand=${ENABLE_WWAND} mt5700m=${ENABLE_MT5700M} qmodem=${ENABLE_QMODEM} oaf=${ENABLE_OAF} higoros=${ENABLE_HIGOROS}"
 	log "UI            : argon=${ENABLE_THEME_ARGON} istore=${ENABLE_ISTORE} tailscale=${ENABLE_TAILSCALE}"
-	# Say plainly whether the default network is open — "encryption=none" is
-	# easy to miss in a build log and this is a security-relevant default.
+	# Say plainly which names and whether the network is open — "encryption=none"
+	# is easy to miss in a build log and this is a security-relevant default.
+	# Both SSIDs are printed: with distinct per-band names a wrong suffix in one
+	# of them is otherwise invisible until someone tries to join that band.
 	if [ "${H5000M_WIFI_ENCRYPTION}" = 'none' ]; then
-		log "First boot    : wifi=${H5000M_WIFI_SSID}/${H5000M_WIFI_COUNTRY} OPEN NETWORK (no password) offload=sw:${H5000M_FLOW_OFFLOAD}/hw:${H5000M_FLOW_OFFLOAD_HW}"
+		log "First boot    : wifi2g=${H5000M_WIFI_SSID_2G} wifi5g=${H5000M_WIFI_SSID_5G} country=${H5000M_WIFI_COUNTRY} OPEN NETWORK (no password) offload=sw:${H5000M_FLOW_OFFLOAD}/hw:${H5000M_FLOW_OFFLOAD_HW}"
 	else
-		log "First boot    : wifi=${H5000M_WIFI_SSID}/${H5000M_WIFI_COUNTRY} ${H5000M_WIFI_ENCRYPTION} offload=sw:${H5000M_FLOW_OFFLOAD}/hw:${H5000M_FLOW_OFFLOAD_HW}"
+		log "First boot    : wifi2g=${H5000M_WIFI_SSID_2G} wifi5g=${H5000M_WIFI_SSID_5G} country=${H5000M_WIFI_COUNTRY} ${H5000M_WIFI_ENCRYPTION} offload=sw:${H5000M_FLOW_OFFLOAD}/hw:${H5000M_FLOW_OFFLOAD_HW}"
 	fi
-	log "apk source    : ${H5000M_APK_REPO_URL:-(none)}"
+	log "apk source    : ${H5000M_APK_REPO_URL:-(none)}${H5000M_APK_REPO_URL:+/${H5000M_KERNEL_ABI:+${H5000M_KERNEL_ABI}/}packages.adb}"
+	log "kernel ABI    : ${H5000M_KERNEL_ABI:-(unknown — flat index, the next build will overwrite it)}"
 	log "Optional      : upnp=${ENABLE_UPNP} adblock=${ENABLE_ADBLOCK} dockerman=${ENABLE_DOCKERMAN}"
 	log "Repo extras   : build=${ENABLE_REPO_PACKAGES} (services are =m unless their switch is on)"
 	log "Proxy/DNS     : nikki-rs=${ENABLE_NIKKI} openclash=${ENABLE_OPENCLASH} mosdns=${ENABLE_MOSDNS} homeproxy=${ENABLE_HOMEPROXY} adguardhome=${ENABLE_ADGUARDHOME}"
@@ -1078,6 +1140,11 @@ prepare_feeds() {
 	# revision rather than the branch head.  See FEEDS_SNAPSHOT_DATE.
 	pin_all_feeds
 
+	# After pin_all_feeds, because that is what resets the checkouts, and before
+	# `feeds install` / the package prepare step, because the patches have to be
+	# sitting in feeds/<feed>/<pkg>/patches/ when the package is unpacked.
+	apply_feed_patches
+
 	log "Installing feeds"
 	run_with_timeout "$FEEDS_TIMEOUT" ./scripts/feeds install -a ||
 		die "feeds install failed"
@@ -1211,6 +1278,70 @@ pin_all_feeds() {
 # build that is meant to track the feed upstream should do.  A non-empty value
 # is a reproduction knob: the run is then a function of a fixed feed, so a
 # package drop can only come from the tree.
+# Backport the fixes upstream landed *after* the feed snapshot date.
+#
+# Why this is needed: pin_all_feeds() rolls every feed back to the commit that
+# was current at the tree's commit time, so a fix pushed to a feed a few days
+# later is invisible here even though the branch head already carries it.
+# The 2026-10-22 cold build hit exactly that: libacl 2.4.0 (2026-06-29) started
+# exporting acl_get_file_at()/acl_set_file_at()/acl_delete_def_file_at(), while
+# GNU tar 1.35 declares its own three-argument wrappers with those very names,
+# so src/xattrs.c stopped compiling with "conflicting types".  openwrt/packages
+# fixed it on 2026-10-21 (baba60db, carrying GNU tar 08c3fc2e); the pin here is
+# 2026-10-16, so the patch is carried in feeds-patches/ until the pin moves past
+# that date.  Delete the directory entry (and this function, if it empties) when
+# OPENWRT_PINNED_REVISION is newer than 2026-10-21.
+#
+# Layout: feeds-patches/<feed>/<path inside feed>/<pkg>/<name>.patch
+#   e.g. feeds-patches/packages/utils/tar/100-....patch
+#       -> feeds/packages/utils/tar/patches/100-....patch
+#
+# If the feed's own patches/ directory already mentions the same upstream
+# commit, the feed has caught up and our copy is skipped rather than applied
+# twice.
+apply_feed_patches() {
+	local patch rel name pkg_dir dst upstream n=0
+
+	for patch in "${ROOT_DIR}"/feeds-patches/*/*/*/*.patch; do
+		[ -f "$patch" ] || continue
+
+		rel="${patch#"${ROOT_DIR}"/feeds-patches/}"
+		rel="${rel%/*}"
+		name="${patch##*/}"
+		pkg_dir="${SRC}/feeds/${rel}"
+
+		if [ ! -d "$pkg_dir" ]; then
+			warn "feed patch ${name}: feeds/${rel} does not exist - skipped"
+			continue
+		fi
+
+		# Same upstream commit already present? Then the feed is ahead of us.
+		# --exclude our own file name, or a second run would mistake the copy we
+		# installed last time for upstream's and report it as such.
+		upstream="$(sed -n 's/.*[?&]id=\([0-9a-f]\{7,40\}\).*/\1/p' "$patch" | head -1)"
+		if [ -n "$upstream" ] && [ -d "${pkg_dir}/patches" ] &&
+			grep -rqs --exclude="$name" "$upstream" "${pkg_dir}/patches"; then
+			log "feed patch ${name}: already upstream in feeds/${rel} - skipped"
+			continue
+		fi
+
+		dst="${pkg_dir}/patches/${name}"
+		if [ -f "$dst" ]; then
+			log "feed patch ${name}: already in place"
+			continue
+		fi
+
+		mkdir -p "${pkg_dir}/patches"
+		cp "$patch" "$dst" ||
+			die "could not install feed patch ${name} into feeds/${rel}"
+		log "feed patch ${name} -> feeds/${rel}/patches/"
+		n=$((n + 1))
+	done
+
+	[ "$n" -gt 0 ] && log "installed ${n} local feed patch(es)"
+	return 0
+}
+
 pin_qmodem_feed() {
 	is_true "$ENABLE_QMODEM" || return 0
 	[ -n "$QMODEM_PINNED_REVISION" ] || return 0
@@ -2054,6 +2185,94 @@ stage_directory() {
 	fi
 }
 
+# Read the assembled rootfs back and insist the generated config is the one this
+# run produced.
+#
+# The image is built from build_dir/target-*/root-<board>, which sits on disk
+# after `make world` — so this reads the exact tree that gets flashed, without
+# unpacking anything, in milliseconds.
+#
+# The check exists because the failure it catches is invisible in the logs: the
+# script writes the files and prints their new values, then OpenWrt installs a
+# cached copy of the package and the image keeps the PREVIOUS build-id and the
+# PREVIOUS apk source URL.  Presence checks stay green, the upgrade page
+# compares against a build-id belonging to another commit, and ~180 minutes
+# plus one flash are spent on an image that is the old one under a new name.
+# Measured on 2026-10-20: the fe12b96 image said 8a4f740.
+verify_generated_config_landed() {
+	local want root got checked=0 id list
+
+	want="${GITHUB_SHA:-}"
+	[ -n "$want" ] || want="$(git -C "${ROOT_DIR}" rev-parse HEAD 2>/dev/null || true)"
+
+	shopt -s nullglob
+	for root in "${SRC}"/build_dir/target-*/root-*/etc/h5000m-build-id; do
+		checked=$((checked + 1))
+		id="${root%/etc/h5000m-build-id}"
+		got="$(sed -n 's/^commit=//p' "$root" | head -n1)"
+
+		if [ -n "$want" ] && [ "$got" != "$want" ]; then
+			die "the assembled rootfs (${id}) carries commit=${got:-<empty>} but this build is ${want} — the package was not reinstalled, so the image is the previous build. See purge_package_build_state."
+		fi
+
+		list="${id}/etc/apk/repositories.d/50-h5000m.list"
+		if [ -n "${H5000M_KERNEL_ABI:-}" ] && [ -f "$list" ]; then
+			if ! grep -q "/${H5000M_KERNEL_ABI}/packages.adb" "$list"; then
+				die "the assembled rootfs (${id}) points at the flat apk index, but kernel ABI ${H5000M_KERNEL_ABI} is known — the per-ABI URL never reached the image"
+			fi
+		fi
+	done
+	shopt -u nullglob
+
+	if [ "$checked" -eq 0 ]; then
+		warn "No assembled rootfs carried /etc/h5000m-build-id; the generated-config check did not run (build_dir layout changed?)"
+	else
+		log "Generated config verified against the assembled rootfs (${checked} tree(s), commit ${want:-unknown})"
+	fi
+
+	return 0
+}
+
+# Drop a package's build state so its next `install` step actually runs.
+#
+# OpenWrt builds a package once and then remembers it: `Build/Compile` and
+# `Package/*/install` are gated on stamp files that live inside the package's
+# PKG_BUILD_DIR.  CI restores build_dir from a cache (seed_cached_build_state)
+# and normalize_source_mtimes resets the source timestamps, so a package that
+# is staged AGAIN with different files/ looks untouched and is never
+# reinstalled.
+#
+# That is not theoretical.  The generated runtime config — /etc/h5000m-build-id,
+# /etc/h5000m-defaults.conf, /etc/apk/repositories.d/50-h5000m.list — is
+# rewritten on every run from build inputs.  The image built from fe12b96
+# carried a build-id saying 8a4f740 and the flat apk index URL, while the build
+# log at the same moment printed the per-ABI URL it had just written.  Every
+# assertion that only asked "does this file exist" stayed green; the image was
+# the previous build with a new name.  Cost: a full build and a wasted flash.
+#
+# h5000m-integration has an empty Build/Compile, so discarding its whole build
+# directory costs nothing.  Packages that actually compile are deliberately not
+# touched: for them the same failure reads "my patch is in the tree but not in
+# the image", and each one has to be judged on its own cost.
+purge_package_build_state() {
+	local name="$1" d
+
+	for d in "${SRC}"/build_dir/target-*/"${name}"; do
+		[ -d "$d" ] || continue
+		rm -rf "$d"
+		log "Dropped cached build state for ${name} so its files/ tree is reinstalled"
+	done
+
+	# The installed-package record and the packaged archive the image stage
+	# consumes.  Both spellings are matched because the tree still mixes them,
+	# and a stale archive here is copied into the image verbatim.
+	rm -rf "${SRC}"/staging_dir/target-*/pkginfo/"${name}".* 2>/dev/null || true
+	rm -f "${SRC}"/bin/targets/"${TARGET_BOARD}"/"${TARGET_SUBTARGET}"/packages/"${name}"-*.apk 2>/dev/null || true
+	rm -f "${SRC}"/bin/targets/"${TARGET_BOARD}"/"${TARGET_SUBTARGET}"/packages/"${name}"_*.ipk 2>/dev/null || true
+
+	return 0
+}
+
 install_local_packages() {
 	local pkg
 
@@ -2110,9 +2329,11 @@ write_h5000m_runtime_config() {
 	# first-boot script and leave the radios unconfigured on every boot, with
 	# nothing in the logs but a one-line parse error.  Refuse to build instead.
 	local var val
-	for var in H5000M_WIFI_SSID H5000M_WIFI_KEY H5000M_WIFI_COUNTRY \
+	for var in H5000M_WIFI_SSID H5000M_WIFI_SSID_2G H5000M_WIFI_SSID_5G \
+		H5000M_WIFI_KEY H5000M_WIFI_COUNTRY \
 		H5000M_WIFI_ENCRYPTION H5000M_WIFI_HTMODE_2G H5000M_WIFI_HTMODE_5G \
-		H5000M_FLOW_OFFLOAD H5000M_FLOW_OFFLOAD_HW; do
+		H5000M_FLOW_OFFLOAD H5000M_FLOW_OFFLOAD_HW \
+		H5000M_QMODEM_WORKER_INTERVAL; do
 		val="${!var}"
 		case "$val" in
 			*"'"*) die "${var} contains a single quote — /etc/h5000m-defaults.conf would not be valid shell. Change the value and rebuild." ;;
@@ -2125,6 +2346,8 @@ write_h5000m_runtime_config() {
 	cat >"$conf" <<EOF
 # Generated by scripts/local-build.sh — do not edit; edit the build instead.
 H5000M_WIFI_SSID='${H5000M_WIFI_SSID}'
+H5000M_WIFI_SSID_2G='${H5000M_WIFI_SSID_2G}'
+H5000M_WIFI_SSID_5G='${H5000M_WIFI_SSID_5G}'
 H5000M_WIFI_KEY='${H5000M_WIFI_KEY}'
 H5000M_WIFI_COUNTRY='${H5000M_WIFI_COUNTRY}'
 H5000M_WIFI_ENCRYPTION='${H5000M_WIFI_ENCRYPTION}'
@@ -2132,6 +2355,7 @@ H5000M_WIFI_HTMODE_2G='${H5000M_WIFI_HTMODE_2G}'
 H5000M_WIFI_HTMODE_5G='${H5000M_WIFI_HTMODE_5G}'
 H5000M_FLOW_OFFLOAD='${H5000M_FLOW_OFFLOAD}'
 H5000M_FLOW_OFFLOAD_HW='${H5000M_FLOW_OFFLOAD_HW}'
+H5000M_QMODEM_WORKER_INTERVAL='${H5000M_QMODEM_WORKER_INTERVAL}'
 EOF
 
 	# Root-only: this file carries the WiFi key in clear text, and the package
@@ -2143,14 +2367,27 @@ EOF
 	# anything with a kmod dependency fails there.  customfeeds.list is the
 	# file OpenWrt reserves for additions and explicitly survives sysupgrade.
 	if [ -n "${H5000M_APK_REPO_URL:-}" ]; then
+		# The index lives in a per-ABI directory so a later build cannot
+		# overwrite it out from under this device — see build_apk_repository
+		# for why that matters.  The ABI has to be known HERE, before anything
+		# is compiled, which is what $H5000M_KERNEL_ABI is for; without it the
+		# flat legacy path is written, and that is stated out loud rather than
+		# guessed at.
+		abi_here="$(kernel_abi)"
+		if [ -n "$abi_here" ]; then
+			idx_url="${H5000M_APK_REPO_URL%/}/${abi_here}/packages.adb"
+		else
+			idx_url="${H5000M_APK_REPO_URL%/}/packages.adb"
+			warn "Kernel ABI not known at image-configuration time (set H5000M_KERNEL_ABI); writing the flat index URL, which the next build for a different ABI will overwrite"
+		fi
 		{
 			printf '# This project'"'"'s own apk repository: every package from the same\n'
 			printf '# build as this firmware, so the kmods match this kernel ABI.\n'
-			printf '# The repository is the apk-repo/ artifact; serve that directory\n'
-			printf '# over HTTP(S) and point H5000M_APK_REPO_URL at it.\n'
-			printf '%s/packages.adb\n' "${H5000M_APK_REPO_URL%/}"
+			printf '# The index sits under a directory named after that ABI, so a build\n'
+			printf '# for a different kernel writes elsewhere and leaves this one intact.\n'
+			printf '%s\n' "$idx_url"
 		} >"${repo_dir}/50-h5000m.list"
-		log "Firmware apk source: ${H5000M_APK_REPO_URL%/}/packages.adb"
+		log "Firmware apk source: ${idx_url}"
 
 		# The web upgrade channel is published next to the repository, so the
 		# base URL is the same string with the index filename stripped.  Kept in
@@ -2203,6 +2440,13 @@ EOF
 		printf 'commit=%s\n' "$build_commit"
 		printf 'built=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 	} >"${build_id}"
+
+	# Everything above only edits the staged files/ tree.  OpenWrt installs a
+	# package whose build stamp is gone, not one whose files changed, so say it
+	# out loud here — otherwise a cached build ships the previous run's
+	# build-id and apk source while the log claims the new ones (see
+	# purge_package_build_state).
+	purge_package_build_state h5000m-integration
 
 	return 0
 }
@@ -2950,50 +3194,190 @@ prune_dangling_depends() {
 # It goes into the package's own patches/ directory, not patches/ at the top
 # level: nftables' source is downloaded into build_dir at build time, so it is
 # not part of the checked-out tree that apply_patches() operates on.
-install_nftables_patches() {
-	local fwdir="${SRC}/package/network/config/firewall4/patches"
-	local libdir="${SRC}/package/libs/libnftnl/patches"
-	local dir="${SRC}/package/network/utils/nftables/patches"
-	local f
+# Install one package's patches into its patches/ directory, and refuse to go on
+# when there is nothing to install.
+#
+# Three things this gets right that the old inline version did not:
+#
+#   * A missing patches/ directory is not a reason to skip a package.  Upstream
+#     deleted package/network/utils/nftables/patches/ when nftables 1.1.7
+#     merged its build patches, and the old whole-function guard turned that one
+#     deletion into "no fullcone support anywhere in the userspace" while still
+#     reporting success.  OpenWrt picks up any patches/ directory next to a
+#     package Makefile, so creating it is the correct response.
+#   * Zero patches in a source directory is a hard error, not a warning.  That
+#     is exactly the state the old guard produced, and nothing noticed for
+#     hours — the compile finished, and only the firewall4 assertions failed.
+#   * Each package is handled on its own, so one package's directory layout can
+#     no longer decide another package's fate.
+install_patch_dir() {
+	local dest="$1" src="$2" name="$3"
+	local f count=0
 
-	[ -d "$dir" ] || {
-		warn "No nftables patches directory; fullcone will not be available to nft"
+	mkdir -p "$dest" || die "$name: cannot create $dest"
+
+	shopt -s nullglob
+	for f in "$src"/*.patch; do
+		if ! cp -f "$f" "$dest/$(basename "$f")"; then
+			shopt -u nullglob
+			die "$name: cannot install $f into $dest"
+		fi
+		log "  installed $name patch $(basename "$f")"
+		count=$((count + 1))
+	done
+	shopt -u nullglob
+
+	[ "$count" -gt 0 ] || die "$name: no patches in $src — expected at least one"
+	return 0
+}
+
+# Patch the nftables userspace with fullcone support.
+#
+# The `fullcone` expression the kernel module registers is invisible to nftables
+# unless the userspace parser knows it, so a rule using it cannot even be
+# written, let alone take effect.  Upstream nftables has no such support.
+#
+# The patches are the single commit from fullcone-nat-nftables/ rebased onto
+# whatever mainline ships.  They go into each package's own patches/ directory,
+# not patches/ at the top level: the sources are downloaded into build_dir at
+# build time, so they are not part of the checked-out tree apply_patches()
+# operates on.
+#
+# ★ WHY THIS IS THREE INDEPENDENT CALLS — the 2026-10-16 failure.
+#
+#   Upstream advanced nftables 1.1.6 -> 1.1.7 and libnftnl 1.3.1 -> 1.3.2 and
+#   deleted package/network/utils/nftables/patches/.  This function used to open
+#   with `[ -d $nftables/patches ] || { warn ...; return 0; }`, so that single
+#   deletion silently dropped the patches for all three packages.  The build
+#   compiled for an hour and then failed only the firewall4 assertions, because
+#   the two userspace layers were still being answered by a cached build_dir
+#   holding sources that a previous run had already patched.
+#
+#   Both halves are fixed.  Here the guard is gone, a missing directory is
+#   created, and an empty source directory is fatal.  In the workflow the
+#   fullcone gate now also asserts the three patch files are present in the
+#   package tree, so a cached build_dir can no longer answer for them.
+install_nftables_patches() {
+	# firewall4 is the layer that actually emits the rules: without it nft knows
+	# the `fullcone` keyword and nothing ever writes one.
+	install_patch_dir "${SRC}/package/network/config/firewall4/patches" \
+		"${ROOT_DIR}/firewall4-patches" firewall4
+	# libnftnl is the layer beneath: nftables' own fullcone code refers to
+	# NFTNL_EXPR_FULLCONE_* constants, and without them the nftables build stops
+	# with "'NFTNL_EXPR_FULLCONE_FLAGS' undeclared" — which is exactly how the
+	# missing layer announced itself.
+	install_patch_dir "${SRC}/package/libs/libnftnl/patches" \
+		"${ROOT_DIR}/libnftnl-patches" libnftnl
+	# And nftables itself: its parser has to know the keyword before any rule
+	# using it can be written.
+	install_patch_dir "${SRC}/package/network/utils/nftables/patches" \
+		"${ROOT_DIR}/nftables-patches" nftables
+
+	return 0
+}
+
+# Trim a config field, and strip a trailing CR, without starting a process.
+#
+# `x=$(printf '%s' "$x" | tr -d '\r' | sed ...)` is three process spawns for a
+# trim.  That is free on a CI runner and costs about a second per field inside
+# the sandbox this is developed in, where spawning a process is roughly 250 ms
+# — enough that a sixty-line config took minutes to parse and looked like a
+# hang.  `printf -v` is a builtin, so this stays one.
+trim_into() { # <variable name> <value>
+	local v="$2"
+	v=${v%$'\r'}
+	v="${v#"${v%%[![:space:]]*}"}"
+	v="${v%"${v##*[![:space:]]}"}"
+	printf -v "$1" '%s' "$v"
+}
+
+# Stop applying upstream patches that upstream has itself superseded.
+#
+# WHY A "DROP" AND NOT A PATCH OF OURS
+#
+#   On 2026-10-16 main carried two patches for the same seven lines of
+#   libjson-c's json_object.c — 002 landed 2026-10-15, 010 landed 2026-10-16
+#   and 002 was never removed.  002 applies, 010's hunk then has no context
+#   left, and the package fails at `prepare` with "Hunk #1 FAILED at 435".
+#   Nothing about that tree is wrong on our side; it is simply not buildable
+#   by anyone, and the unpinned path — the only one that may advance the pin —
+#   is exactly the path that has to build it.
+#
+#   There is no way to make `patch` tolerate this: 010 does not apply, it is
+#   not a fuzz or offset problem.  The only two options are "wait for upstream"
+#   (the unpinned build is red for as long as that takes, and the pin cannot
+#   move) or "do not apply the redundant one".  This function does the second.
+#   Nothing is rewritten: the patch that survives is unmodified upstream text,
+#   and both of these fix the identical NDEBUG leak.
+#
+# WHY THE GUARD FIELD IS THE WHOLE POINT
+#
+#   A permanent "delete this file from the upstream tree" list rots: upstream
+#   removes the duplicate, and the rule goes on deleting a patch that is now
+#   the only fix.  So every rule names a GUARD patch that must also be present
+#   for the drop to fire.  Rules are then self-limiting — when upstream fixes
+#   the duplication, the rule stops firing on its own — and a rule whose guard
+#   has gone missing is reported as a warning rather than quietly doing
+#   nothing.  See configs/upstream-patch-drops.conf.
+#
+#   The build does not silently depend on this: .github/workflows/checks.yml
+#   replays the surviving series against the real upstream tarball on both the
+#   pinned revision and main, so a rule that stopped being right, or a second
+#   duplicate landing next week, is a twenty-second check instead of a
+#   thirty-minute build failure.
+drop_superseded_upstream_patches() {
+	local conf="${ROOT_DIR}/configs/upstream-patch-drops.conf"
+	local pkg victim guard why dir dropped=0 skipped=0
+
+	[ -f "$conf" ] || {
+		log "No upstream patch drops configured."
 		return 0
 	}
 
-	# firewall4 last: it is the layer that actually emits the rules.  Without it
-	# nft knows the `fullcone` keyword and nothing ever writes one.
-	mkdir -p "$fwdir"
-	shopt -s nullglob
-	for f in "${ROOT_DIR}"/firewall4-patches/*.patch; do
-		cp -f "$f" "${fwdir}/$(basename "$f")"
-		log "  installed firewall4 patch $(basename "$f")"
-	done
-	shopt -u nullglob
+	# Fields are `|` separated; the last one is free text and may contain
+	# spaces.  CR is stripped because these files have been committed with
+	# CRLF before and a stray CR turns a filename into a filename that does
+	# not exist — the drop would then silently never fire.
+	while IFS='|' read -r pkg victim guard why || [ -n "$pkg" ]; do
+		trim_into pkg "$pkg"
+		trim_into victim "$victim"
+		trim_into guard "$guard"
 
-	# libnftnl first: it is the layer beneath.  nftables' own fullcone code
-	# refers to NFTNL_EXPR_FULLCONE_* constants, and without them the nftables
-	# build stops with "'NFTNL_EXPR_FULLCONE_FLAGS' undeclared" — which is
-	# exactly how the missing layer announced itself.
-	# libnftnl ships without a patches/ directory, so create it.  OpenWrt picks
-	# up any patches/ directory next to a package Makefile at build time.
-	mkdir -p "$libdir"
-	if [ -d "$libdir" ]; then
-		shopt -s nullglob
-		for f in "${ROOT_DIR}"/libnftnl-patches/*.patch; do
-			cp -f "$f" "${libdir}/$(basename "$f")"
-			log "  installed libnftnl patch $(basename "$f")"
-		done
-		shopt -u nullglob
+		case "$pkg" in
+			'' | '#'*) continue ;;
+		esac
+
+		dir="${SRC}/${pkg}/patches"
+		if [ ! -d "$dir" ]; then
+			warn "  drop rule for ${pkg}: no ${pkg}/patches/ directory in this tree — rule skipped"
+			skipped=$((skipped + 1))
+			continue
+		fi
+		if [ ! -f "${dir}/${victim}" ]; then
+			# The normal end of a rule's life: upstream removed the duplicate.
+			log "  drop rule for ${pkg}: ${victim} is gone — nothing to drop"
+			continue
+		fi
+		if [ ! -f "${dir}/${guard}" ]; then
+			# Never drop without the guard.  Doing so would throw away the
+			# only remaining copy of a fix.
+			warn "  drop rule for ${pkg}: guard ${guard} is missing — dropping nothing"
+			skipped=$((skipped + 1))
+			continue
+		fi
+
+		rm -f "${dir}/${victim}" \
+			|| die "cannot drop ${dir}/${victim}"
+		warn "  dropped superseded upstream patch ${pkg}/patches/${victim} (its guard ${guard} is present)"
+		dropped=$((dropped + 1))
+	done <"$conf"
+
+	if [ "$dropped" -gt 0 ]; then
+		warn "  ${dropped} upstream patch(es) not applied; see configs/upstream-patch-drops.conf"
 	fi
-
-	shopt -s nullglob
-	for f in "${ROOT_DIR}"/nftables-patches/*.patch; do
-		cp -f "$f" "${dir}/$(basename "$f")"
-		log "  installed nftables patch $(basename "$f")"
-	done
-	shopt -u nullglob
-
+	if [ "$skipped" -gt 0 ]; then
+		warn "  ${skipped} drop rule(s) could not be applied — the config and the tree disagree"
+	fi
 	return 0
 }
 
@@ -3943,6 +4327,15 @@ build_required_packages() {
 	is_true "$ENABLE_WWAND" && REQUIRED_PACKAGES+=(wwand wwand-qmi wwand-ncm wwand-mbim luci-app-wwand luci-proto-wwand)
 	is_true "$ENABLE_MT5700M" && REQUIRED_PACKAGES+=(luci-app-mt5700m ubus-at-daemon sms-tool_q)
 	is_true "$ENABLE_THEME_ARGON" && REQUIRED_PACKAGES+=(luci-theme-argon luci-app-argon-config)
+	# libffi: required, and nothing in the config would ever select it on its
+	# own.  python3 links Modules/_ctypes against it (--with-system-ffi) through
+	# a dependency declared by the packages feed, but the pinned tree predates
+	# the commit that moved libffi into the tree — see
+	# local-packages/libffi/Makefile for the full sequence.  Without the symbol
+	# in .config the build dies in python3 with `ffi.h: No such file or
+	# directory`, and only on a build that actually recompiles python3, which is
+	# why three cached builds in a row never noticed.
+	REQUIRED_PACKAGES+=(libffi)
 	# luci-compat: the store package is the lua-era layout (controller/store.lua,
 	# view/store/main.htm — verified live from the prebuilt package), and 25.12
 	# ships no lua runtime.  This mirrors linkease's own installer, which pulls
@@ -4141,10 +4534,14 @@ configure_build() {
 	config_set_symbol "CONFIG_LUCI_LANG_zh_Hans" "y"
 
 	# Re-asserted for the same reason as the language: defconfig regenerates the
-	# feed symbols, and losing this one puts a URL that does not exist back into
-	# the image's apk sources, where it makes every `apk update` on the device
-	# fail.  See the note in configs/h5000m.config.
+	# feed symbols, and losing one puts a URL that does not exist back into the
+	# image's apk sources, where every `apk update` on the device reports it as
+	# unavailable.  One entry per third-party feed in feeds.conf.default — the
+	# official feeds are published by buildbot and must stay live.  See the note
+	# in configs/h5000m.config.
 	config_set_symbol "CONFIG_FEED_wwand" "m"
+	config_set_symbol "CONFIG_FEED_oaf" "m"
+	config_set_symbol "CONFIG_FEED_qmodem" "m"
 
 	build_required_packages
 	local pkg
@@ -4854,6 +5251,8 @@ compile_firmware() {
 	wait "$heartbeat_pid" 2>/dev/null || true
 
 	log "Compilation finished in $((($(date +%s) - start) / 60)) min"
+
+	verify_generated_config_landed
 }
 
 # Say which package failed and why, from the logs make just wrote.
@@ -4929,16 +5328,74 @@ report_build_failure() {
 	return 0
 }
 
-# Assemble a single flat apk repository containing every package this build
-# produced, with one freshly generated index.
+# ------------------------------------------------------------ the kernel ABI ---
 #
-# Why flat rather than OpenWrt's <arch>/<feed>/ tree: the firmware has to be
-# told where the repository lives, and that list is written into the image
-# BEFORE anything is compiled (install_local_packages runs early), so it cannot
-# be derived from which feed directories ended up non-empty.  A flat repository
-# needs exactly one URL and one index, which removes that ordering problem
-# entirely — and removes the empty-feed problem with it, since there are no
-# per-feed directories to be empty.
+# The kernel ABI hash (vermagic) is the one string that decides whether a .apk
+# from a DIFFERENT build can be installed on this image.  Two builds of the same
+# pinned revision a week apart carry different hashes, because the hash covers
+# the kernel's own configuration and the toolchain.  So the repository has to be
+# able to say which ABI an index belongs to before it is published anywhere a
+# stale device might read it.
+#
+# Where it comes from: bin/targets/<board>/<subtarget>/profiles.json, key
+# linux_kernel.vermagic — the same key the official snapshot publishes and the
+# same one write_build_info() records as kernel_abi=.  Read with tr/sed, not
+# python3: a missing python3 must never be the reason the repository loses its
+# ABI directory.
+#
+# Order of preference:
+#   1. $H5000M_KERNEL_ABI   — CI exports what the build produced
+#   2. profiles.json        — after a full build (collect time)
+# Nothing else.  CONFIG_LOCALVERSION is the user's suffix, NOT the ABI hash;
+# deriving a hash from it would be inventing a value.  When neither source is
+# available these callers fall back to the flat, unversioned layout — loudly,
+# with a warning, never silently.
+kernel_abi() {
+	local abi="${H5000M_KERNEL_ABI:-}"
+	local profiles="${SRC}/bin/targets/${TARGET_BOARD}/${TARGET_SUBTARGET}/profiles.json"
+
+	if [ -z "$abi" ] && [ -s "$profiles" ]; then
+		# flatten the JSON with tr, then take the first hex token following
+		# "vermagic" — one value out of the document, no parser needed.
+		abi="$(tr '{},' '\n\n\n' <"$profiles" |
+			sed -n 's/.*"vermagic"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{8,\}\)".*/\1/p' |
+			head -n1)"
+	fi
+
+	# Only a lowercase hex token is accepted.  Anything else — an error page, a
+	# truncated file, a `null` — would become a directory name and a URL path.
+	case "$abi" in
+		"" | *[!0-9a-f]*) printf '' ;;
+		*) printf '%s' "$abi" ;;
+	esac
+}
+
+# Assemble one apk repository containing every package this build produced,
+# indexed once per kernel ABI.
+#
+# Layout — one directory per ABI, index inside it:
+#
+#   apk-repo/
+#     <abi>/packages.adb      + every .apk of that build
+#     firmware/               (staged later, untouched here)
+#     public-key.pem          (shared: one key signs every ABI's index)
+#
+# Why the ABI directory exists at all: the repository is published to ONE URL
+# (GitHub Pages), and every device flashed from this project keeps that URL
+# forever.  Flat, the next build overwrites the only index, so a device one
+# kernel ABI behind reads an index whose kmods it must reject — and the failure
+# is not "one package is stale", it is `apk add luci-app-passwall` resolving to
+# a kmod the running kernel refuses to load, with nothing on screen saying why.
+# With the ABI in the path a build writes only its own directory; older ABIs
+# stay downloadable and are simply no longer written to.
+#
+# Why not OpenWrt's <arch>/<feed> tree: the firmware has to be told where the
+# repository lives, and that list is written into the image BEFORE anything is
+# compiled (install_local_packages runs early), so it cannot be derived from
+# which feed directories ended up non-empty.  One ABI directory with one index
+# removes that ordering problem — and the ABI reaches the image through
+# $H5000M_KERNEL_ABI, which is why the flat fallback is kept instead of being
+# turned into a hard failure.
 #
 # Both package sets must be present for the repository to be useful:
 #   bin/packages/<arch>/<feed>/            architecture-generic packages
@@ -4949,18 +5406,33 @@ build_apk_repository() {
 	local dest="$1"
 	local repo="${dest}/apk-repo"
 	local apk_tool=""
-	local count
+	local count abi pkgdir
 
-	mkdir -p "$repo"
+	abi="$(kernel_abi)"
+	if [ -n "$abi" ]; then
+		pkgdir="${repo}/${abi}"
+		log "Kernel ABI ${abi}: packages go to apk-repo/${abi}/"
+	else
+		pkgdir="$repo"
+		warn "Kernel ABI unknown (no H5000M_KERNEL_ABI, no profiles.json): falling back to the flat layout, which the NEXT build overwrites"
+	fi
+
+	mkdir -p "$pkgdir"
+
+	# This tree is reused between runs (both the firmware tree and the build
+	# directory), so clear THIS ABI's directory: a re-run must not mix two
+	# builds' .apk files, observed once as base-files-1~f0d3e33.apk sitting
+	# next to base-files-1~d0d8c40.apk in one index.
+	find "$pkgdir" -maxdepth 1 -name '*.apk' -delete 2>/dev/null || true
 
 	# Collect from both locations.  cp -a on the tree would keep the per-feed
 	# directories; this flattens deliberately.
 	find "${SRC}/bin/packages/${TARGET_ARCH}" -mindepth 2 -maxdepth 2 -name '*.apk' \
-		-exec cp -f {} "$repo/" \; 2>/dev/null || true
+		-exec cp -f {} "$pkgdir/" \; 2>/dev/null || true
 	find "${SRC}/bin/targets/${TARGET_BOARD}/${TARGET_SUBTARGET}/packages" -maxdepth 1 -name '*.apk' \
-		-exec cp -f {} "$repo/" \; 2>/dev/null || true
+		-exec cp -f {} "$pkgdir/" \; 2>/dev/null || true
 
-	count="$(find "$repo" -maxdepth 1 -name '*.apk' | wc -l)"
+	count="$(find "$pkgdir" -maxdepth 1 -name '*.apk' | wc -l)"
 	if [ "$count" -eq 0 ]; then
 		warn "No .apk files found; the apk repository will be empty"
 		return 0
@@ -4999,23 +5471,28 @@ build_apk_repository() {
 	fi
 
 	# shellcheck disable=SC2046
-	"$apk_tool" mkndx --allow-untrusted "${sign_args[@]}" -o "${repo}/packages.adb" $(find "$repo" -maxdepth 1 -name '*.apk') ||
+	"$apk_tool" mkndx --allow-untrusted "${sign_args[@]}" -o "${pkgdir}/packages.adb" $(find "$pkgdir" -maxdepth 1 -name '*.apk') ||
 		die "apk mkndx failed — the repository would be unreadable"
 
 	if [ "${#sign_args[@]}" -gt 0 ]; then
-		log "Signed ${repo}/packages.adb with the build key"
+		log "Signed ${pkgdir}/packages.adb with the build key"
 	fi
 
 	# Ship the public key with the repository.  The publish job runs on a fresh
 	# runner with only this artifact — it has no openwrt/ tree to look in — so
 	# the key has to travel inside the artifact.  Devices flashed before the key
 	# was fixed fetch it from the same place as the index.
+	#
+	# One copy at the repository root, not one per ABI: the key signs every
+	# ABI's index, and devices are told to fetch it from the root.  The ABI
+	# directory therefore has to be self-contained for PACKAGES, but the key is
+	# a property of the project, not of a kernel.
 	if [ -f "${SRC}/public-key.pem" ]; then
 		cp -f "${SRC}/public-key.pem" "${repo}/public-key.pem"
 		log "Repository public key: ${repo}/public-key.pem"
 	fi
 
-	log "Built apk repository: ${count} packages, $(du -sh "$repo" | cut -f1)"
+	log "Built apk repository: ${count} packages in ${abi:+"ABI ${abi}"}${abi:-the flat root}, $(du -sh "$pkgdir" | cut -f1)"
 	return 0
 }
 
@@ -5095,6 +5572,12 @@ PY
 		)"
 	fi
 
+	# kernel_abi() is the fallback for the case python3 is absent: same key,
+	# read with tr/sed.  Nothing here invents a value — an absent profiles.json
+	# leaves the field out of BUILD-INFO.txt, and the CI ABI recorder then
+	# declines to record rather than writing a guess into .abi.
+	[ -n "${abi:-}" ] || abi="$(kernel_abi)"
+
 	# A shallow clone carries no tags, so scripts/getver.sh can only produce
 	# `r0-<sha>`: the revision counter is derived from the nearest base tag plus
 	# the commit count, and --depth 1 has neither.  When we built exactly the
@@ -5167,6 +5650,11 @@ main() {
 	seed_cached_build_state
 	prepare_feeds
 	apply_patches
+	# Before anything reads a package Makefile, and after the feeds exist: a
+	# rule may name a feed package.  Several of these packages are core, so
+	# this cannot be folded into apply_patches(), which runs at the top level
+	# and never sees a package's own patches/ directory.
+	drop_superseded_upstream_patches
 	# After the feeds exist and before anything reads the Makefile: the pin is a
 	# rewrite of feeds/packages/net/sing-box/Makefile (see pin_sing_box).
 	pin_sing_box

@@ -12,7 +12,26 @@ on:
   # master-protection ruleset to have anything to report: a branch
   # ruleset can only require a check that PRs actually run.
   pull_request:
+  # push used to be tags-only, and that left a five-day hole this repository
+  # fell into on 2026-10-16.
+  #
+  # What happened: upstream deleted package/network/utils/nftables/patches/
+  # (nftables 1.1.7 merged its build patches).  The step further down named
+  # "Verify the fullcone patches still apply to the sources upstream ships"
+  # exists to catch exactly that, and it would have failed — but it did not run,
+  # because the commit went to a branch and the last run had been the Monday
+  # cron, when the tree still carried the directory.  The break stayed invisible
+  # until a full firmware build spent an hour compiling and then failed on the
+  # firewall4 assertions alone (run 38875973016).  A 46-second job was sitting
+  # right there, unfired.
+  #
+  # So branch pushes now run it too.  The tag patterns are unchanged and are
+  # what release-please uses; this is a pure addition, with no path filter, so
+  # the tag semantics cannot be affected by it.
   push:
+    branches:
+      - master
+      - higoros-qmodem
     tags:
       - 'openwrt-*'
       - 'v*'
@@ -832,6 +851,199 @@ jobs:
         uses: ./.github/actions/diagnose
         with:
           title: 仓库与主机检查失败
+  # 2026-10-16："补丁能打上" ≠ "补丁能编过"。
+  #
+  # 当天上游把 libnftnl 的 expr_ops.set 回调多带了一个 byteorder 参数（libnftnl 1.3.1 ->
+  # 1.3.2，而 nftables 1.1.7 的 configure 就要求 libnftnl >= 1.3.2 —— 两包是配套升级）。
+  # 我们的补丁在 `patch --dry-run` 下全部通过、真编译当场被 GCC 判死；上面那条检查只做
+  # dry-run，于是这次事故白跑了一次 40 分钟的全量构建才暴露。
+  #
+  # 这个作业把两套源码真下下来、真打补丁、真编一遍，几十秒给出结论：
+  #   1) 钉版那一对 —— 设备上跑的、发版依赖的就是它；
+  #   2) 上游 main 那一对 —— pin 前进的目标。
+  # 两版的 expr_ops.set 签名不同，只验一边会漏。顺序也不能反：先把打了补丁的 libnftnl
+  # 编出来装进临时前缀，再用它编 nftables。
+  fullcone-build:
+    name: fullcone 补丁编译验证
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config curl xz-utils patch libmnl-dev
+
+      - name: 打补丁并真编 libnftnl 与 nftables（钉版 + 上游 main）
+        run: |
+          set -euo pipefail
+          . configs/upstream.env
+
+          SRC=/tmp/upstream-check
+          WORK=/tmp/fullcone-build
+          rm -rf "$SRC" "$WORK"; mkdir -p "$WORK"
+
+          git clone --depth 1 --branch "${OPENWRT_REPO_BRANCH}" \
+            "${OPENWRT_REPO_URL}" "$SRC"
+
+          # 钉版那一棵树直接按 configs/upstream.env 里的 revision 取，
+          # 不另存一份"钉版用了哪些包"的清单，省得两处打架。
+          PIN="${OPENWRT_PINNED_REVISION:-}"
+          if [ -n "$PIN" ]; then
+            git -C "$SRC" fetch -q --depth 1 origin "$PIN"
+            mkdir -p "$WORK/pinned-tree"
+            git -C "$SRC" archive FETCH_HEAD | tar -x -C "$WORK/pinned-tree"
+          fi
+
+          # 版本与下载地址从 OpenWrt 的包 Makefile 里读，上游升级时这里自动跟着走。
+          pkg_field() { sed -n "s/^$3:=//p" "$1/$2/Makefile" | head -1; }
+
+          tarball() { # <上游树> <包目录> <解压目的地> → 打印 "<name> <version>"
+            local tree="$1" pkgdir="$2" dest="$3" name ver url file
+            name=$(pkg_field "$tree" "$pkgdir" PKG_NAME)
+            ver=$(pkg_field "$tree" "$pkgdir" PKG_VERSION)
+            url=$(pkg_field "$tree" "$pkgdir" PKG_SOURCE_URL)
+            file=$(pkg_field "$tree" "$pkgdir" PKG_SOURCE)
+            url=${url//'$(PKG_NAME)'/$name}; url=${url//'$(PKG_VERSION)'/$ver}
+            file=${file//'$(PKG_NAME)'/$name}; file=${file//'$(PKG_VERSION)'/$ver}
+            curl -fsSL --retry 3 --max-time 120 -o "$dest/$file" "$url/$file" \
+              || { echo "::error::下载 $url/$file 失败"; return 1; }
+            mkdir -p "$dest/$name"
+            tar -xf "$dest/$file" -C "$dest/$name" --strip-components=1
+            printf '%s %s\n' "$name" "$ver"
+          }
+
+          build_one() { # <上游树> <标签>
+            local tree="$1" label="$2" dest prefix ln lnv nf nfv lib
+            dest="$WORK/$2"; prefix="$dest/prefix"; mkdir -p "$prefix"
+
+            echo "=== [$label] libnftnl ==="
+            read -r ln lnv <<<"$(tarball "$tree" package/libs/libnftnl "$dest")"
+            cd "$dest/$ln"
+            patch -p1 --batch < "$GITHUB_WORKSPACE/libnftnl-patches/100-fullcone-expression.patch"
+            echo "    [$label] $ln $lnv 的 expr_ops.set 声明："
+            grep -oE '\(\*set\)\(struct nftnl_expr \*e[^)]*\)' include/expr_ops.h \
+              | head -1 | sed 's/^/      /'
+            ./configure --prefix="$prefix" > "$dest/libnftnl.log" 2>&1 \
+              || { echo "::error::[$label] libnftnl $lnv configure 失败"; tail -30 "$dest/libnftnl.log"; exit 1; }
+            make -j"$(nproc)" >> "$dest/libnftnl.log" 2>&1 \
+              || { echo "::error::[$label] libnftnl $lnv 打了补丁后编译失败"; tail -60 "$dest/libnftnl.log"; exit 1; }
+            # 挡住"补丁没进源码树、结果编了个干净树"这种假绿
+            grep -q 'expr/fullcone.lo' "$dest/libnftnl.log" \
+              || { echo "::error::[$label] 编译日志里没有 expr/fullcone.lo —— 补丁可能没落进源码树"; exit 1; }
+            make install >> "$dest/libnftnl.log" 2>&1
+            echo "    [$label] OK：$ln $lnv 的 expr/fullcone.lo 已编译"
+
+            echo "=== [$label] nftables ==="
+            read -r nf nfv <<<"$(tarball "$tree" package/network/utils/nftables "$dest")"
+            cd "$dest/$nf"
+            patch -p1 --batch < "$GITHUB_WORKSPACE/nftables-patches/100-fullcone-expression.patch"
+            # --without-cli：CLI 默认要 libedit，缺了 configure 直接报错；库本身照编。
+            # --with-mini-gmp：省掉 libgmp 依赖，构建期不用装。
+            PKG_CONFIG_PATH="$prefix/lib/pkgconfig" \
+              ./configure --prefix="$prefix" --without-cli --with-mini-gmp > "$dest/nftables.log" 2>&1 \
+              || { echo "::error::[$label] nftables $nfv configure 失败（多半是上游改了依赖）"; tail -30 "$dest/nftables.log"; exit 1; }
+            make -j"$(nproc)" >> "$dest/nftables.log" 2>&1 \
+              || { echo "::error::[$label] nftables $nfv 打了补丁后编译失败"; tail -80 "$dest/nftables.log"; exit 1; }
+            # flex 由 scanner.l 重新生成 scanner.c —— 判据必须落在生成物上
+            grep -q FULLCONE src/scanner.c \
+              || { echo "::error::[$label] 生成的 scanner.c 里没有 FULLCONE —— lexer 那半补丁没生效"; exit 1; }
+            # 不用 `ls | head -1`：开了 pipefail，提前退出会把 ls 判成失败
+            lib=$(find . -name 'libnftables.so*' -print -quit 2>/dev/null || true)
+            if [ -z "$lib" ] || ! grep -qas fullcone "$lib"; then
+              echo "::error::[$label] libnftables.so 里没有 fullcone 表达式名"
+              exit 1
+            fi
+            echo "    [$label] OK：$nf $nfv 的 scanner.c 与 libnftables.so 都带上了 fullcone"
+          }
+
+          if [ -n "$PIN" ]; then
+            build_one "$WORK/pinned-tree" pinned
+            echo "    （钉版 = ${PIN:0:12}，设备实际运行的那一套）"
+            echo
+          else
+            echo "configs/upstream.env 里没有 OPENWRT_PINNED_REVISION，跳过钉版那一套"
+          fi
+          build_one "$SRC" main
+          echo
+          echo "fullcone 补丁在钉版与上游 main 两套源码上都可编、可落位"
+
+      - name: 失败时把编译日志带到工作区
+        if: failure()
+        run: |
+          for f in /tmp/fullcone-build/*/*.log; do
+            [ -f "$f" ] || continue
+            cp -f "$f" "./$(echo "${f#/tmp/fullcone-build/}" | tr '/' '-')"
+          done 2>/dev/null || true
+
+      - name: 失败诊断
+        if: failure()
+        uses: ./.github/actions/diagnose
+        with:
+          title: fullcone 补丁编译验证失败
+          log_files: 'pinned-libnftnl.log pinned-nftables.log main-libnftnl.log main-nftables.log'
+          tail_lines: '80'
+
+  # ---------------------------------------------------------------------------
+  # 上游补丁系列回放
+  #
+  # 为什么要有这个作业：2026-10-16 上游 main 把同一个修复打了两遍 —— libjson-c
+  # 的 002（10-15 引入）和 010（10-16 引入）改的是 json_object.c 同一行 435，
+  # 002 没被撤掉。两补丁同时在的树谁也编不出来：002 先应用，010 的上下文就没了，
+  # 它自己报 "Hunk #1 FAILED at 435"。这个树是 unpinned 派发 run 38897769334
+  # 抓到的，距上游那次提交只过去七分钟，而它花掉三十分钟编译才暴露出来。
+  # 钉版不受影响（它两个补丁都没有）—— 但 unpinned 既跟 main，又是唯一能推进
+  # 钉版的路径。
+  #
+  # scripts/local-build.sh 里 drop_superseded_upstream_patches 会把多余的那个
+  # 停用（见 configs/upstream-patch-drops.conf）。本作业就是证明那条规则是对的：
+  # 拿真实的上游 tarball，把「停用之后剩下的补丁」在钉版和 main 两棵树上各打一遍，
+  # 二十秒出结果。它同时兜住另外三种情形：规则失效（guard 没了）、规则写错、
+  # 以及上游下周又landed一对同改一行的补丁。
+  #
+  # 判据落在 patch 的退出码和它报的 hunk 上，不是文件比对：「这两个补丁都删了
+  # 435 行」只是文本层面的猜测，对任何一个碰了空行或花括号的补丁对都会误报。
+  # ---------------------------------------------------------------------------
+  patch-series:
+    name: 上游补丁系列回放
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates curl xz-utils patch
+
+      - name: 回放（钉版 + 上游 main）
+        run: |
+          set -euo pipefail
+          . configs/upstream.env
+
+          SRC=/tmp/upstream-check
+          rm -rf "$SRC" /tmp/pinned-tree
+          git clone -q --depth 1 --branch "${OPENWRT_REPO_BRANCH}" \
+            "${OPENWRT_REPO_URL}" "$SRC"
+
+          PIN="${OPENWRT_PINNED_REVISION:-}"
+          if [ -n "$PIN" ]; then
+            git -C "$SRC" fetch -q --depth 1 origin "$PIN"
+            mkdir -p /tmp/pinned-tree
+            git -C "$SRC" archive FETCH_HEAD | tar -x -C /tmp/pinned-tree
+            bash scripts/verify-patch-series.sh /tmp/pinned-tree pinned
+          else
+            echo "configs/upstream.env 里没有 OPENWRT_PINNED_REVISION，跳过钉版那一套"
+          fi
+
+          bash scripts/verify-patch-series.sh "$SRC" main
+
   commitlint:
     name: 提交信息规约
     runs-on: ubuntu-24.04

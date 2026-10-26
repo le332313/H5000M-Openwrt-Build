@@ -37,6 +37,13 @@ artifacts/
 artifacts-*/
 source.tar.gz
 
+# The kernel ABI this build produced, written by build.yml so the NEXT pinned
+# run can name the right apk-repo/<abi>/ directory before it compiles anything.
+# A build output, not a source file: it changes every time a pin advances, and
+# committing it would make the image's package source depend on what someone
+# happened to commit rather than on what was actually built.
+kernel-abi.txt
+
 # ---------------------------------------------------------------------------
 # Packages cloned at build time: the three FAN789 board plugins, the Argon
 # theme, the optional proxy stack and ddimension/wwand.  They are fetched into

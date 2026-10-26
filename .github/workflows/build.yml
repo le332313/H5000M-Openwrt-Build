@@ -96,6 +96,9 @@ concurrency:
 # file: a compromised action now gets a read-only token.
 permissions:
   contents: read
+  # kernel-abi.txt 只活在上一个 run 的 artifact 里，Build 之前要把它读回来
+  # （见 "Restore the kernel ABI record" 一步）。只读，不给写权限。
+  actions: read
 
 # Action majors are pinned deliberately: checkout v7 / upload-artifact v7 /
 # cache v6 are the first majors whose action.yml declares `using: node24`.  The
@@ -296,12 +299,31 @@ jobs:
           IMAGE: ghcr.io/${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_ACTOR: ${{ github.actor }}
+          # COLD_BUILD is a repository variable, not a dispatch input: the input
+          # list is already at GitHub's ceiling of ten.  `true` skips the
+          # restore, so every package is compiled from source.
+          COLD_BUILD: ${{ vars.COLD_BUILD || 'false' }}
         run: |
           set -euo pipefail
           image="$(echo "${IMAGE}" | tr '[:upper:]' '[:lower:]')/buildcache"
           tag="$(sha256sum configs/h5000m.config feeds.conf.default | sha256sum | cut -c1-16)"
           echo "image=${image}" >> "$GITHUB_OUTPUT"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+          # A cache-restored build is not proof that the tree is self-consistent:
+          # a stale build_dir carries .built stamps that hide a missing
+          # dependency, which is exactly how libffi went unnoticed on 2026-10-20
+          # (python3 was never recompiled, so `ffi.h: No such file` only appeared
+          # on a cold tree).  Skipping the restore is the only way to tell the
+          # difference.  The save step below still runs under the same tag, so a
+          # successful cold build replaces the cached baseline — that is the
+          # intent, not a side effect.
+          if [ "${COLD_BUILD:-false}" = "true" ]; then
+            echo "COLD_BUILD=true — 跳过构建缓存恢复，本轮全量编译"
+            rm -rf .buildcache
+            mkdir -p .buildcache
+            exit 0
+          fi
 
           # `github.actor` is a login name, but it reaches the shell only via
           # the environment: interpolating it here would be template injection
@@ -382,6 +404,40 @@ jobs:
           else
             echo "::warning::H5000M_SIGNING_KEY is not set, so this build signs the package index with a key of its own. Devices flashed from a different build will report an untrusted signature and refuse the repository."
           fi
+
+      # ★ kernel-abi.txt 只存在**上一个构建的 artifact** 里，而 artifact 不会
+      #   自己出现在新 run 的工作区。Build 那步用 `-s kernel-abi.txt` 决定
+      #   apk 源写成 <url>/<abi>/packages.adb 还是扁平 —— 少了这一步，记录
+      #   写了、传了，却永远没人读回来：10-20 run 39345957259 的日志原话就是
+      #   "no kernel-abi.txt entry for the pinned revision"，镜像于是仍指扁平
+      #   索引，而 ABI 分目录在仓库侧早就建好了。所谓「要再等一轮」的假象，
+      #   等的其实就是这一步不存在。
+      #
+      #   拿不到不算失败：首次 pinned 构建本来就没有记录，Build 会打 warning
+      #   并回退扁平（闸门 A 的 A16 会把「pinned 却是扁平」判红）。
+      - name: Restore the kernel ABI record from the previous build
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.pinned }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUILD_DIR: ${{ (github.event_name == 'workflow_dispatch' && inputs.runner_type == 'self-hosted') && github.workspace || '/o' }}
+        run: |
+          set -euo pipefail
+          cd "$BUILD_DIR"
+          aid="$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=kernel-abi&per_page=20" \
+                 --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | last | .id // empty' \
+                 2>/dev/null || true)"
+          if [ -z "${aid}" ]; then
+            echo "no kernel-abi artifact yet; the build falls back to the flat index and warns"
+            exit 0
+          fi
+          curl -fsSL --retry 3 \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${aid}/zip" \
+            -o /tmp/kernel-abi.zip
+          unzip -o -q /tmp/kernel-abi.zip -d .
+          echo "restored kernel-abi.txt (artifact ${aid}):"
+          sed -n '1,2p' kernel-abi.txt
 
       - name: Build
         # Build from $BUILD_DIR: /o (the short bind mount created above) on a
@@ -506,6 +562,58 @@ jobs:
             export H5000M_APK_REPO_URL="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}"
           fi
           echo "apk repository URL for the firmware: ${H5000M_APK_REPO_URL}"
+
+          # The upstream pin, if this run compiles one.  local-build.sh reads it
+          # from the same file; the ABI lookup below needs it first.
+          #
+          # `|| true`: this step runs under `set -e`, and a missing or unreadable
+          # configs/upstream.env must not abort a build that is otherwise about
+          # to report a real error.  An empty pin simply means "unpinned", which
+          # the branch below handles.
+          . configs/upstream.env || true
+          if [ "${PINNED:-false}" != "true" ]; then
+            OPENWRT_PINNED_REVISION=""
+          fi
+
+          # The kernel ABI the image must point its package source at, so the
+          # index URL becomes <url>/<abi>/packages.adb.  It has to be decided
+          # NOW — the source list is written into the image before anything is
+          # compiled — and it must be the ABI this very build will produce, or
+          # the firmware ships pointing at a directory that the next run either
+          # never creates (build fails → 404 on every `apk update`) or
+          # overwrites with kmods of a different kernel.
+          #
+          # ★ Do NOT take it from the previous build's BUILD-INFO.txt.  That
+          #   describes a DIFFERENT build, and reusing it would make this image
+          #   advertise an ABI it may not have — the exact failure the ABI
+          #   directory exists to prevent, only now silent.
+          #
+          # What the ABI actually is, once known:
+          #   * OPENWRT_PINNED_REVISION is set (`--pinned`) → every run of that
+          #     pin compiles the same kernel with the same config, so its
+          #     vermagic is stable for the life of the pin.  Published next to
+          #     the pin in kernel-abi.txt (below) and reused.
+          #   * unpinned → the tree moves, so the ABI is not known until after
+          #     the compile.  Nothing is guessed: the build falls back to the
+          #     flat index and warns, and build_apk_repository() still files the
+          #     packages under their real ABI directory for later use.
+          #
+          # ★ kernel-abi.txt is NOT a dotfile on purpose.  The first version of
+          #   this used `.abi` and actions/upload-artifact silently skipped it
+          #   (`include-hidden-files` defaults to false), so the record was
+          #   written and then discarded — run 39023527785 published a correct
+          #   per-ABI repository while its image still pointed at the flat
+          #   index, because the file this step reads had never survived.
+          if [ -n "${OPENWRT_PINNED_REVISION:-}" ] && [ -s kernel-abi.txt ] &&
+             [ "$(sed -n '1p' kernel-abi.txt)" = "$OPENWRT_PINNED_REVISION" ]; then
+            export H5000M_KERNEL_ABI="$(sed -n '2p' kernel-abi.txt)"
+            echo "kernel ABI for the pinned revision ${OPENWRT_PINNED_REVISION}: ${H5000M_KERNEL_ABI}"
+          elif [ -n "${OPENWRT_PINNED_REVISION:-}" ]; then
+            echo "::warning::no kernel-abi.txt entry for the pinned revision ${OPENWRT_PINNED_REVISION}; this image will point at the un-ABI'd index until one is recorded"
+          else
+            echo "unpinned build: the kernel ABI is not knowable before the compile, so the package source stays flat"
+          fi
+          echo "package index will be: ${H5000M_APK_REPO_URL%/}/${H5000M_KERNEL_ABI:+${H5000M_KERNEL_ABI}/}packages.adb"
 
           ./scripts/local-build.sh "${args[@]}"
 
@@ -645,7 +753,24 @@ jobs:
           fail=0
           check() { if bash -c "$2" >/dev/null 2>&1; then echo "  OK    $1"; else echo "  FAIL  $1"; fail=$((fail+1)); fi; }
 
-          echo "=== layer 1: kernel module ==="
+          echo "=== layer 0: the fullcone patches reached the package tree ==="
+          # These are the files install_nftables_patches() copies in.  Asserting
+          # them here is what makes the 2026-10-16 failure impossible to repeat:
+          # upstream deleted package/network/utils/nftables/patches/ (nftables
+          # 1.1.7 merged its build patches), the installer opened with
+          # `[ -d $nftables/patches ] || return 0`, no patch was installed for
+          # ANY of the three packages, and the two userspace checks further down
+          # still passed — because the 17 GB build_dir cache held sources that
+          # an earlier run had already patched.  A patch file sitting in the
+          # package tree cannot be answered by that cache.
+          check "the nftables fullcone patch is in the package tree" \
+            'test -f openwrt/package/network/utils/nftables/patches/100-fullcone-expression.patch'
+          check "the libnftnl fullcone patch is in the package tree" \
+            'test -f openwrt/package/libs/libnftnl/patches/100-fullcone-expression.patch'
+          check "the firewall4 fullcone patch is in the package tree" \
+            'test -f openwrt/package/network/config/firewall4/patches/100-fullcone-support.patch'
+
+          echo; echo "=== layer 1: kernel module ==="
           check "nft_fullcone.ko was built" \
             'find openwrt/build_dir/target-*/linux-*/nft-fullcone -name nft_fullcone.ko | grep -q .'
           check "the module registers the fullcone expression" \
@@ -680,6 +805,14 @@ jobs:
           check "libnftables.so carries the fullcone expression name" \
             'grep -rqas fullcone openwrt/build_dir/target-*/nftables-*/*/src/.libs/libnftables.so.*'
 
+          # The same question asked of the packaged artefact rather than of the
+          # source tree.  A cached build_dir can satisfy every source-tree
+          # assertion above; it cannot answer for what .pkgdir holds, because
+          # that is produced by this run's own install step.
+          check "libnftables.so in the package dir carries the fullcone expression" \
+            'L=$(find openwrt/build_dir/target-*/libnftnl-*/.pkgdir -name "libnftnl.so.*" 2>/dev/null | head -1);
+             [ -n "$L" ] && strings "$L" | grep -q expr_ops_fullcone'
+
           echo; echo "=== layer 4: firewall4 ==="
           check "firewall4 accepts fullcone in its parse_defaults whitelist" \
             'grep -rqs --include=fw4.uc "fullcone: \[ \"bool\", \"0\" \]" openwrt/build_dir/target-*/firewall4-*/'
@@ -690,6 +823,12 @@ jobs:
           check "the acceleration page depends on all four layers" \
             'grep -q kmod-nft-fullcone openwrt/package/luci-app-h5000m-accel/Makefile &&
              grep -q firewall4 openwrt/package/luci-app-h5000m-accel/Makefile'
+
+          # Artefact-level, like the libnftnl one above: the .uc files as they
+          # will be packaged, not the copies in the source tree.
+          check "the packaged firewall4 templates emit fullcone" \
+            'F=$(find openwrt/build_dir/target-*/firewall4-*/.pkgdir -name zone-masq.uc 2>/dev/null | head -1);
+             [ -n "$F" ] && grep -q fullcone "$F"'
 
           echo; echo "=== config ==="
           check "firewall4 =y" 'grep -q "^CONFIG_PACKAGE_firewall4=y$" openwrt/.config'
@@ -891,14 +1030,29 @@ jobs:
           set -uo pipefail
           cd "$BUILD_DIR"
           APK=openwrt/staging_dir/host/bin/apk
-          INDEX=artifacts/apk-repo/packages.adb
+          # The repository is laid out one directory per kernel ABI, so the index
+          # is not at a fixed path.  Take it from BUILD-INFO.txt — the ABI this
+          # build actually produced — rather than from a directory listing: a
+          # leftover ABI directory from an earlier run must never be the one the
+          # gate reads, or the gate passes on a repository this run did not make.
+          ABI="$(sed -n 's/^kernel_abi=//p' artifacts/BUILD-INFO.txt 2>/dev/null | head -n1)"
+          if [ -n "$ABI" ] && [ -s "artifacts/apk-repo/${ABI}/packages.adb" ]; then
+            INDEX="artifacts/apk-repo/${ABI}/packages.adb"
+          elif [ -s artifacts/apk-repo/packages.adb ]; then
+            INDEX=artifacts/apk-repo/packages.adb
+            echo "::warning::no index under the recorded ABI '${ABI}'; checking the flat one"
+          else
+            INDEX=""
+          fi
           ARCH=aarch64_cortex-a53
           fail=0
           ok()  { echo "  OK    $1"; }
           bad() { echo "  FAIL  $1"; fail=$((fail + 1)); }
 
           [ -x "$APK" ] || { echo "::error::no apk tool at $APK to read the index with"; exit 1; }
+          [ -n "$INDEX" ] || { echo "::error::no package index in artifacts/apk-repo/ (looked for <abi>/packages.adb and packages.adb)"; exit 1; }
           [ -s "$INDEX" ] || { echo "::error::$INDEX is missing or empty"; exit 1; }
+          echo "checking $INDEX for kernel ABI '${ABI:-unknown}'"
 
           ROOT="$(mktemp -d)"
           mkdir -p "$ROOT/cache"
@@ -1145,6 +1299,18 @@ jobs:
           echo "=== BUILD-INFO.txt ==="
           cat artifacts/BUILD-INFO.txt 2>/dev/null || echo "(not produced)"
           echo
+          echo "=== apk repository layout ==="
+          # The layout is now <abi>/packages.adb rather than packages.adb at the
+          # root, so say which ABI directory this build produced and how many
+          # packages went into it.  On success this is also what the firmware's
+          # 50-h5000m.list must name; a mismatch here is the whole failure mode
+          # the ABI directory exists to make visible instead of silent.
+          find artifacts/apk-repo -mindepth 1 -maxdepth 2 -name 'packages.adb' 2>/dev/null |
+            while read -r idx; do
+              printf '  %s  (%s packages)\n' "${idx#artifacts/apk-repo/}" \
+                "$(find "$(dirname "$idx")" -maxdepth 1 -name '*.apk' | wc -l)"
+            done
+          echo
           echo "=== images ==="
           ls -la artifacts/ 2>/dev/null || true
 
@@ -1316,6 +1482,7 @@ jobs:
         with:
           subject-path: |
             artifacts/*squashfs-sysupgrade.bin
+            artifacts/apk-repo/**/packages.adb
             artifacts/apk-repo/packages.adb
 
       - name: Upload apk repository
@@ -1324,6 +1491,73 @@ jobs:
           name: apk-repo
           path: artifacts/apk-repo/
           if-no-files-found: error
+          retention-days: 14
+
+      # Record the kernel ABI this build actually produced, keyed by the upstream
+      # revision it compiled.  The next `pinned` run has to write its package
+      # source into the image BEFORE the compile, so it cannot learn its own ABI
+      # any other way — and guessing is worse than not knowing, because the image
+      # would then advertise an ABI directory that does not exist (every
+      # `apk update` 404s) or that holds another kernel's kmods.
+      #
+      # Keyed by revision, not by date: a pin compiles ONE kernel with one
+      # config, so its vermagic is stable for as long as the pin holds.  When
+      # `advance-pin` moves the pin, the key no longer matches and this file
+      # stops being consulted until the next build records the new pair.
+      #
+      # Best-effort on purpose: this file only improves the NEXT build.  Failing
+      # the current one over it would trade a certain good firmware for a
+      # bookkeeping detail.
+      - name: Record the kernel ABI for the pinned revision
+        if: success()
+        run: |
+          set -uo pipefail
+          # Explicit path, never a bare relative one: this is a plain file in the
+          # checkout root, and a later `cd` in another step must not be able to
+          # move it.  $GITHUB_WORKSPACE is the checkout for a normal job.
+          out="${GITHUB_WORKSPACE:-$PWD}/kernel-abi.txt"
+          abi="$(sed -n 's/^kernel_abi=//p' artifacts/BUILD-INFO.txt | head -n1)"
+          rev="$(sed -n 's/^openwrt_revision=//p' artifacts/BUILD-INFO.txt | head -n1)"
+
+          # Compare against the pin that is on disk NOW, not the revision this
+          # run compiled: a `latest` build compiles some other commit, and
+          # recording its ABI under the pin's name would be a false statement
+          # about a kernel nobody has built yet.
+          . configs/upstream.env || true
+          pin="${OPENWRT_PINNED_REVISION:-}"
+          if [ -z "$abi" ] || [ -z "$rev" ] || [ -z "$pin" ]; then
+            echo "::warning::not recording a kernel ABI (abi='${abi}' rev='${rev}' pin='${pin}')"
+            exit 0
+          fi
+          if [ "$rev" != "$pin" ]; then
+            echo "this run compiled ${rev}, but the pin is ${pin}; nothing to record"
+            exit 0
+          fi
+
+          printf '%s\n%s\n' "$pin" "$abi" >"$out"
+          echo "recorded: ${pin} -> ${abi}"
+          echo "written to: ${out}"
+          cat "$out"
+
+      - name: Upload the ABI record
+        if: success()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: kernel-abi
+          # NOT a dotfile.  actions/upload-artifact defaults to
+          # `include-hidden-files: false`, so `.abi` uploaded as "No files were
+          # found" while the step above had just written it successfully —
+          # observed on run 39023527785, where the record was produced and
+          # silently discarded.  A visible name removes that whole class of
+          # mistake rather than switching a flag on.
+          path: kernel-abi.txt
+          # 这一步写不写文件，取决于「本轮编译的 revision 是否等于钉版」：
+          # latest 轨道编的是上游 HEAD，记录下来就是一条假陈述，所以
+          # "Record the kernel ABI" 会 exit 0 且不写文件。原来这里写 error，
+          # 于是 run 39888666509（latest，固件 89 MB 已构建、已上传、已签名）
+          # 在最后一步被判红 —— 固件是好的，红的只是一个本该允许缺失的 artifact。
+          # 缺失不是异常：首次 pinned 构建同样没有记录，Build 会打 warning 并回退扁平索引。
+          if-no-files-found: ignore
           retention-days: 14
 
       - name: Publish release
@@ -1662,15 +1896,55 @@ jobs:
             exit 1
           fi
 
+      # What this build published, in the one place a stale device can read it.
+      #
+      # abi.txt names the ABI directory THIS run filled.  attest.yml reads it to
+      # find the index it should attest, and the index page below lists it, so
+      # the site always says which kernel its kmods belong to instead of leaving
+      # that to be inferred from a directory name nobody displays.
+      #
+      # Also drops a flat copy of that ABI's index at the site root.  The flat
+      # path is what devices flashed BEFORE this change have baked into
+      # /etc/apk/repositories.d/50-h5000m.list, and they can never be rewritten
+      # in place — only reflashed.  Keeping the root index working means those
+      # devices keep installing while they migrate; it is a compatibility copy,
+      # not the canonical location, and the ABI directory is what the future
+      # builds point at.
+      - name: Publish the ABI marker and the legacy index
+        run: |
+          set -euo pipefail
+          abi=""
+          for d in apk-repo/*/; do
+            [ -f "${d}packages.adb" ] || continue
+            case "$(basename "$d")" in firmware) continue ;; esac
+            abi="$(basename "$d")"
+            break
+          done
+
+          if [ -z "$abi" ]; then
+            # The build could not determine its own ABI and filed everything at
+            # the root.  Say so; do not invent a value.
+            printf 'flat\n' >apk-repo/abi.txt
+            echo "::warning::no per-ABI directory in the artifact; the site is flat and abi.txt says 'flat'"
+          else
+            printf '%s\n' "$abi" >apk-repo/abi.txt
+            cp -f "apk-repo/${abi}/packages.adb" apk-repo/packages.adb
+            echo "published ABI ${abi}; root packages.adb kept as the legacy copy"
+          fi
+          cat apk-repo/abi.txt
+
       - name: Write an index page
         run: |
           set -euo pipefail
-          count="$(find apk-repo -maxdepth 1 -name '*.apk' | wc -l)"
+          abi="$(sed -n '1p' apk-repo/abi.txt 2>/dev/null || echo '')"
+          [ "$abi" = "flat" ] && abi=""
+          idxdir="apk-repo${abi:+/${abi}}"
+          count="$(find "$idxdir" -maxdepth 1 -name '*.apk' | wc -l)"
           # Measure the packages only.  `du -sh apk-repo` used to be the whole
           # story, but the directory now also carries firmware/ (~140 MB), and
           # reporting that as the size of the package repository would be wrong
           # by two orders of magnitude.
-          size="$(du -ch apk-repo/*.apk 2>/dev/null | tail -n1 | cut -f1)"
+          size="$(du -ch "$idxdir"/*.apk 2>/dev/null | tail -n1 | cut -f1)"
           fwsize="$(du -sh apk-repo/firmware 2>/dev/null | cut -f1 || echo '-')"
           fwrev="$(sed -n 's/.*"revision": *"\([^"]*\)".*/\1/p' apk-repo/firmware/latest.json 2>/dev/null | head -n1)"
           cat > apk-repo/index.html <<EOF
@@ -1690,13 +1964,20 @@ jobs:
           </head>
           <body>
             <h1>Hiveton H5000M 主线 OpenWrt 软件包仓库</h1>
-            <p>这是固件自带的软件源，包含 <strong>${count}</strong> 个软件包，共 ${size}。
+            <p>这是固件自带的软件源，本轮 <strong>${count}</strong> 个软件包，共 ${size}。
                内核模块与固件同一次构建产出，因此 ABI 完全匹配。</p>
-            <p>索引地址：<a href="packages.adb">packages.adb</a></p>
+            <p>内核 ABI：<code>${abi:-未记录}</code>　索引地址：
+               <a href="${abi:+${abi}/}packages.adb">${abi:+${abi}/}packages.adb</a></p>
+            <p>仓库按内核 ABI 分目录存放：每个 ABI 一个目录、一个索引。这样重新构建不会
+               覆盖上一个内核的索引 —— 旧设备仍能安装与它自己内核匹配的包，而不会被指向
+               一个 vermagic 对不上的 kmod。固件里写的是带 ABI 的那条地址。</p>
+            <p>站点根目录的 <code>packages.adb</code> 是兼容副本，指向本轮的 ABI 目录，
+               只为尚未刷写新固件的设备保留。</p>
             <h2>在路由器上使用</h2>
             <p>固件构建时已把这个地址写入 <code>/etc/apk/repositories.d/50-h5000m.list</code>，
-               通常无需手动配置。若需手工添加：</p>
-            <pre>echo 'https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/packages.adb' \\
+               通常无需手动配置。若需手工添加（把 <code>&lt;ABI&gt;</code> 换成
+               <code>abi.txt</code> 里的值）：</p>
+            <pre>echo 'https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/${abi:+${abi}/}packages.adb' \\
             >> /etc/apk/repositories.d/customfeeds.list
           apk update
           apk add luci-app-passwall</pre>

@@ -122,7 +122,14 @@ def merge(target_text: str, extra_text: str):
         for i, line in enumerate(lines):
             if re.match(rf'^        "{group}": \{{[ \t]*$', line):
                 block = list(block)
-                block[-1] += ","
+                # 块尾必须带逗号，但它可能**已经带了**：上游
+                # luci-app-qmodem-generic 的 main 分支从 2026-10-19 起把每个
+                # model 块写成 `},` 结尾（之前是不带逗号的 `}`）。无条件
+                # += "," 会产出 `},,` —— 只多一个字符，整份库就再也读不出来，
+                # 而报错落在「第 41 行第 15 列」这种和真正原因无关的位置上，
+                # 表现为「合并结果不是合法 JSON」。先剥再加，两种写法都对。
+                tail = block[-1].rstrip()
+                block[-1] = tail if tail.endswith(",") else tail + ","
                 lines[i + 1:i + 1] = block
                 placed = True
                 break

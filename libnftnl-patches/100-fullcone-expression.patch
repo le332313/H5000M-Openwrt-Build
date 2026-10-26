@@ -1,16 +1,7 @@
 diff --git a/include/libnftnl/expr.h b/include/libnftnl/expr.h
-index 1c07b54..cf57de9 100644
 --- a/include/libnftnl/expr.h
 +++ b/include/libnftnl/expr.h
-@@ -21,6 +21,7 @@ void nftnl_expr_free(const struct nftnl_expr *expr);
- 
- bool nftnl_expr_is_set(const struct nftnl_expr *expr, uint16_t type);
- int nftnl_expr_set(struct nftnl_expr *expr, uint16_t type, const void *data, uint32_t data_len);
-+int nftnl_expr_set_imm(struct nftnl_expr *expr, uint16_t type, const void *data, uint32_t data_len, uint32_t byteorder);
- #define nftnl_expr_set_data nftnl_expr_set
- void nftnl_expr_set_u8(struct nftnl_expr *expr, uint16_t type, uint8_t data);
- void nftnl_expr_set_u16(struct nftnl_expr *expr, uint16_t type, uint16_t data);
-@@ -269,9 +270,18 @@ enum {
+@@ -269,9 +269,18 @@ enum {
  	NFTNL_EXPR_MASQ_FLAGS		= NFTNL_EXPR_BASE,
  	NFTNL_EXPR_MASQ_REG_PROTO_MIN,
  	NFTNL_EXPR_MASQ_REG_PROTO_MAX,
@@ -116,7 +107,7 @@ new file mode 100644
 index 0000000..533741a
 --- /dev/null
 +++ b/src/expr/fullcone.c
-@@ -0,0 +1,166 @@
+@@ -0,0 +1,194 @@
 +/* SPDX-License-Identifier: GPL-2.0-or-later */
 +/*
 + * (C) 2022 wongsyrone
@@ -157,6 +148,34 @@ index 0000000..533741a
 +	}
 +	return 0;
 +}
++
++/*
++ * expr_ops.set grew a trailing `byteorder' argument in libnftnl 1.3.2 (1.3.1
++ * and older take four).  fullcone has no use for it, so keep the four-argument
++ * implementation and reach it through whichever entry point matches the struct
++ * member this build declares.  Choosing with the compiler keeps one patch
++ * working against both source trees instead of freezing it to one.
++ */
++#if defined(__GNUC__)
++static int __attribute__((unused))
++nftnl_expr_fullcone_set_byteorder(struct nftnl_expr *e, uint16_t type,
++				  const void *data, uint32_t data_len,
++				  uint32_t byteorder)
++{
++	(void)byteorder;
++	return nftnl_expr_fullcone_set(e, type, data, data_len);
++}
++
++#define H5000M_EXPR_SET_TAKES_BYTEORDER \
++	(!__builtin_types_compatible_p(__typeof__(((struct expr_ops *)0)->set), \
++		int (*)(struct nftnl_expr *, uint16_t, const void *, uint32_t)))
++
++#define H5000M_EXPR_SET_FN \
++	__builtin_choose_expr(H5000M_EXPR_SET_TAKES_BYTEORDER, \
++		nftnl_expr_fullcone_set_byteorder, nftnl_expr_fullcone_set)
++#else
++#define H5000M_EXPR_SET_FN nftnl_expr_fullcone_set
++#endif
 +
 +static const void *nftnl_expr_fullcone_get(const struct nftnl_expr *e,
 +					   uint16_t type, uint32_t *data_len)
@@ -277,7 +296,7 @@ index 0000000..533741a
 +	.alloc_len	= sizeof(struct nftnl_expr_fullcone),
 +	.nftnl_max_attr	= __NFTNL_EXPR_FULLCONE_MAX - 1,
 +	.attr_policy	= fullcone_attr_policy,
-+	.set		= nftnl_expr_fullcone_set,
++	.set		= H5000M_EXPR_SET_FN,
 +	.get		= nftnl_expr_fullcone_get,
 +	.parse		= nftnl_expr_fullcone_parse,
 +	.build		= nftnl_expr_fullcone_build,

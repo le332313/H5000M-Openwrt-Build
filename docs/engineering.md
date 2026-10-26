@@ -574,24 +574,30 @@ OpenWrt 出厂把所有 radio 设为 `disabled`，要登录并选国家才启用
 uci-defaults 有可能在任何 radio 段存在之前就运行、什么都没配上。把 hotplug 脚本编到
 `20`（在 `10-wifi-detect` 之后）才能保证顺序。
 
-应用一次后用 `/etc/h5000m-defaults-applied` 标记，并由
-`lib/upgrade/keep.d/h5000m-defaults` 让 sysupgrade 保留该标记，所以后续刷机
-**不会重置用户改过的设置**。判断条件也很保守：只要任一 AP 的 SSID 已不是默认值，
+应用一次后用 `/etc/h5000m-wifi-applied` 与 `/etc/h5000m-offload-applied` 两个**独立**标记
+（无线与卸载开关可用的时机不同，共用一个标记会让先到的那个烧掉标记、另一个永远不再执行），
+并由 `lib/upgrade/keep.d/h5000m-defaults` 让 sysupgrade 保留这两个标记，所以后续刷机
+**不会重置用户改过的设置**。判断条件也很保守：只要任一 AP 的 SSID 既不是出厂名
+（`openwrt` / `OpenWrt` / 空）也不是本镜像可能写过的名字（基名 + 两个分频名），
 就完全不碰。
 
 默认值（构建时可覆盖，见下表）：
 
 ```
-SSID       openwrt
-密码       无                ← 默认开放网络，请自行加密
-国家/加密  CN / none
+SSID       2.4G = Higoros-H5000M-2.4G      5G = Higoros-H5000M-5G
+           （基名 Higoros-H5000M；两频分开命名，省得"网速慢"时看不出挂在哪一频）
+密码       H987654321
+国家/加密  CN / sae-mixed（= WPA2/WPA3 混合，老设备回落 WPA2，不会连不上）
 htmode     2.4G=EHT40  5G=EHT160
 ```
 
-**默认是开放网络**：`encryption=none` 且不写 `key`。这样一台刚刷好的设备无需任何凭据即可
-连上，凭据不会被印在某个没人看的地方。首启脚本在无密码时**删除** `key` 选项而不是写入
-空值，并且**不设置** `ieee80211w` —— 在未加密接口上要求 PMF 会让 hostapd 拒绝整份 AP
-配置。构建日志会明确写出 `OPEN NETWORK`。
+**默认是加密的**（`sae-mixed` + 密码），因为开放 AP 的代价是所有出厂设备都开着；
+`encryption=none` + 空 `key` 仍是受支持的构建组合（两个变量都是构建输入），
+该路径下首启脚本会**删除** `key` 选项而不是写空值，并且**不设置** `ieee80211w` —— 在
+未加密接口上要求 PMF 会让 hostapd 拒绝整份 AP 配置。反过来，`sae-mixed` **必须**配
+`ieee80211w=1`（PMF 至少可选），两者是成套的。已实测：hostapd 生效配置为
+`wpa_key_mgmt=SAE WPA-PSK WPA-PSK-SHA256`，`iwinfo` 报
+`Encryption: SAE / WPA-PSK / WPA-PSK-SHA256 (CCMP)`。
 
 另外**不写** `bss_transition` —— 官方紧凑版 wpad 不认识该 hostapd 选项，会导致
 **整个 AP 配置被拒绝**。
@@ -652,10 +658,27 @@ bin/targets/<board>/<subtarget>/packages/   全部 kmod   ← 别的仓库给不
 `/etc/apk/repositories.d/50-h5000m.list`（OpenWrt 为此保留的文件，且 sysupgrade 会保留）。
 CI 会自动按运行它的仓库推导地址，并有独立 job 把仓库发布到 Pages。
 
+**(c) 第三方 feed 会在 `distfeeds.list` 里留下死链 —— 已修复。**
+OpenWrt 为**每一个**已配置的 feed 都往 `/etc/apk/repositories.d/distfeeds.list` 写一行
+（`include/feeds.mk` 的 `FeedSourcesAppendAPK`，由 `package/base-files/install` 调用），
+而这些 URL 只对 buildbot 真正发布的 feed 存在。本镜像从第三方仓库拉三个 feed
+（`oaf` / `qmodem` / `wwand`），2026-10-14 的镜像里 `.../oaf/packages.adb` 与
+`.../qmodem/packages.adb` 实测 404，设备上每次 `apk update` 报 2 条 WARNING +
+`2 unavailable`（`is-opkg update` 仍返回 0、10627 包可用，**功能无损，是噪音不是故障**）。
+
+修法是在 `.config` 里把 `CONFIG_FEED_oaf` / `CONFIG_FEED_qmodem` / `CONFIG_FEED_wwand`
+置 `m`：`feeds.mk` 仍写这两行，但会加 `#` 前缀，死链不再是活行。`CONFIG_FEED_*` 在整个
+构建系统里只被 `feeds.mk` 和 `base-files` 的 `PKG_CONFIG_DEPENDS` 引用，**不参与任何包的
+选择、安装或构建**，所以它只能压掉那条 URL，不会改变镜像内容。见
+`configs/h5000m.config` 的 feeds 段；闸门 A 的 **A11** 用「活行」判据守着它
+（负对照在 2026-10-14 的镜像上实测报红）。
+
 | 构建变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `H5000M_APK_REPO_URL` | 空 | 仓库基址；**留空则固件不带额外源**（指向不存在的托管会让 `apk update` 报错） |
-| `H5000M_WIFI_SSID` / `_KEY` / `_COUNTRY` / `_ENCRYPTION` | `openwrt` / 空 / `CN` / `none` | 首启无线默认值；默认无密码 |
+| `H5000M_WIFI_SSID` / `_SSID_2G` / `_SSID_5G` | `Higoros-H5000M` / `<基名>-2.4G` / `<基名>-5G` | 首启无线名称：基名 + 两个可分别覆盖的频段名 |
+| `H5000M_WIFI_KEY` / `_ENCRYPTION` | `H987654321` / `sae-mixed` | 首启无线凭据；`none` + 空 key 即开放网络 |
+| `H5000M_WIFI_COUNTRY` | `CN` | 首启国家码 |
 | `H5000M_FLOW_OFFLOAD` / `_HW` | `1` / `1` | 软件 / PPE 硬件卸载 |
 
 ### 8. 调制解调器重复 —— 已修复（只剩一个 wwand）
@@ -1068,7 +1091,8 @@ rootfs 里（`tun.ko`/`dummy.ko`/`inet_diag.ko`）、`sing-box` 二进制在、�
 包进仓库还不够，**还要有人真的依赖它**。这一条是用真机 + apk 自己复现出来的。
 
 把发布出去的 `packages.adb` 当成一个真实仓库，配上一台设备会有的全部源（本仓库 +
-`distfeeds.list` 里那 7 条官方 snapshot 源），用本机编译出的 `staging_dir/host/bin/apk`
+`distfeeds.list` 里指向 `downloads.openwrt.org` 的 7 条源；当时另有 `oaf` / `qmodem`
+两条第三方源是 404，见第 7 节 (c)），用本机编译出的 `staging_dir/host/bin/apk`
 去问：
 
 ```
@@ -1096,9 +1120,12 @@ config PACKAGE_luci-app-ssr-plus_INCLUDE_Xray
 
 ```
 sing-box policy:
-  1.12.25-r1:  https://existyay.github.io/AutoBuild-H5000M-Openwrt/packages.adb
+  1.12.25-r1:  https://existyay.github.io/AutoBuild-H5000M-Openwrt/<abi>/packages.adb
   1.14.0-r1:   https://downloads.openwrt.org/snapshots/.../packages.adb   ← 会被选中
 ```
+
+（`<abi>` 是内核 vermagic，见本节末尾的"按 ABI 分目录"；这段输出是分目录之前采集的，
+当时索引直接放在站点根。）
 
 修法是给每个前端补一条**真实依赖**（`LUCI_DEPENDS+=`，插在 `include .../luci.mk`
 之前，`luci.mk:184` 的 `DEPENDS:=$(LUCI_DEPENDS)` 就会看到它）。`=m` 的包写 `+dep`
@@ -1127,9 +1154,57 @@ luci-app-momo       → momo sing-box
 > 且 stdout 非空"当作通过条件，并且逐条断言"某个前端确实拉到了某个核"。
 
 发布前门禁新增 `Verify the built repository can satisfy every frontend on its own`：
-只配置本仓库（不配官方源），用本机 apk 读**将被发布的** `artifacts/apk-repo/packages.adb`，
+只配置本仓库（不配官方源），用本机 apk 读**将被发布的** `artifacts/apk-repo/<abi>/packages.adb`，
 断言 15 个前端、12 个核/守护进程、20 个 kmod、12 个中文语言包都在索引里，
 `sing-box` 是 1.12.25，并且 10 个前端各自都能**解析出它需要的核**。
+
+其中 `<abi>` 取自本轮 `BUILD-INFO.txt` 的 `kernel_abi=`，**不取"目录里最新的那个"** ——
+残留的旧 ABI 目录如果更新，会让门禁验的是一个本轮根本没产出的仓库。
+
+### apk 仓库按内核 ABI 分目录（2026-10-17）
+
+**问题。** 仓库发布在**一个固定 URL** 上（GitHub Pages），而每台刷过本项目固件的设备都
+把这个地址写死在 `/etc/apk/repositories.d/50-h5000m.list` 里，且**永远改不掉**（只能重刷）。
+仓库是扁平的、只有一个 `packages.adb` 时，下一次构建会把它覆盖掉 —— 落后一个内核 ABI
+的设备读到的索引里全是它必须拒绝的 kmod。失败形状不是"某个包过期了"，而是
+`apk add luci-app-passwall` 解析出一个内核拒绝加载的 kmod，而屏幕上什么都不会说。
+
+**做法。** 目录按 ABI 分层，一个 ABI 一个目录、一个索引：
+
+```
+apk-repo/
+  <abi>/packages.adb     + 本次构建的全部 .apk
+  abi.txt                ← 本次发布填的是哪个 ABI 目录（publish 步骤写）
+  packages.adb           ← 兼容副本，内容是该 ABI 的索引
+  public-key.pem         ← 一把钥匙签所有 ABI 的索引，放根目录
+  firmware/              ← 一键升级通道，与之前相同
+```
+
+`<abi>` = `profiles.json` 的 `linux_kernel.vermagic`（本项目实测值
+`0c53a09af37f3986899893a223266bba` 一类的小写十六进制串），取值优先级：
+
+1. `$H5000M_KERNEL_ABI` —— CI 传进来
+2. `profiles.json` —— 构建结束后
+
+**没有第三个来源。** `CONFIG_LOCALVERSION` 是用户后缀，不是 ABI 哈希；拿它反推就是在编造值。
+两个来源都没有时函数返回空串，调用方**明确回退到扁平布局并告警**，不静默降级。
+
+**这里有一个无法回避的时序矛盾。** `50-h5000m.list` 是在 `install_local_packages` 阶段写进
+镜像的，**远早于** `profiles.json` 存在。所以镜像里的 ABI 只能靠构建前就知道的通道拿到：
+
+- **`--pinned` 构建**：pin 固定了一个内核 + 一份 config，vermagic 在 pin 有效期内是稳定的。
+  于是 CI 把 "pin 的 revision → ABI" 记进 `.abi`（`build.yml` 的
+  `Record the kernel ABI for the pinned revision` 步骤，只在**本轮编译的 revision 正好等于
+  当前 pin** 时写），下一次 pinned 构建开工前读它。
+- **非 pinned 构建**：树在动，ABI 编译完才知道。**不猜** —— 镜像回退扁平索引并告警，
+  但包仍然按真实 ABI 归档到对应目录，留给以后用。
+
+**★ 绝不能拿"上一次构建的 BUILD-INFO.txt"当 ABI 来源。** 它描述的是另一次构建，
+拿它当本轮的 ABI 会让镜像宣传一个它可能没有的 ABI 目录 —— 正好是分目录要防的那个失败，
+而且变成静默的。
+
+**兼容。** 站点根的 `packages.adb` 保留为本轮 ABI 索引的副本：已经刷过机的设备写在镜像里的
+就是这条路，它们没法就地改。这是兼容副本，不是规范位置。
 
 ---
 
